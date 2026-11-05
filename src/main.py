@@ -10,11 +10,12 @@ async def main():
         page = await browser.new_page()
 
         # Login inicial en Fuvex
-        await page.goto("https://url-fuvex.com/login")
-        await page.fill("#usuario", os.getenv("FUVEX_USER"))
-        await page.fill("#password", os.getenv("FUVEX_PASS"))
-        await page.click("#btn-login")
-        await page.wait_for_url("**/dashboard")
+        await page.goto("https://fuvexbn.a365.com.pe:7443/index.php")
+        await page.fill("#USUARIO", os.getenv("FUVEX_USER"))
+        await page.fill("input[type='password']", os.getenv("FUVEX_PASS"))
+        await page.click("button[type='submit']")
+        await page.click("text=Iniciar sesión con Google")
+        await page.wait_for_url("**/menu.php")
 
         print("[*] Bot conectado y escuchando Supabase...")
 
