@@ -14,14 +14,24 @@ if not supabase_url or not supabase_key:
 supabase = create_client(supabase_url, supabase_key)
 
 
+def _monto_numerico(valor):
+    try:
+        return float(str(valor or "0").replace(",", "").strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def obtener_pendientes(excluir_dnis=None, cantidad=2):
-    """Lee filas sin estado y con monto entre 20 000 y 99 999, mayor primero."""
+    """Lee hasta los mejores pendientes válidos de cada estado, mayor monto primero."""
+    if cantidad <= 0:
+        return []
     excluir_dnis = excluir_dnis or set()
     filas_por_dni = {}
     estados_sin_procesar = (None, "None", "pendiente")
 
     for estado in estados_sin_procesar:
         inicio = 0
+        validos_estado = 0
         while True:
             consulta = (
                 supabase.table("clientes")
@@ -48,14 +58,18 @@ def obtener_pendientes(excluir_dnis=None, cantidad=2):
                     and nombre.lower() not in {"", "none", "null"}
                     and dni not in excluir_dnis
                 ):
-                    filas_por_dni[dni] = fila
+                    if dni not in filas_por_dni:
+                        filas_por_dni[dni] = fila
+                        validos_estado += 1
+            if validos_estado >= cantidad:
+                break
             if len(pagina) < 100:
                 break
             inicio += 100
 
     filas = sorted(
         filas_por_dni.values(),
-        key=lambda fila: float(fila.get("monto") or 0),
+        key=lambda fila: _monto_numerico(fila.get("monto")),
         reverse=True,
     )
     return filas[:cantidad]

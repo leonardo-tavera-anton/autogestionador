@@ -2,6 +2,7 @@ import asyncio
 import os
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
@@ -12,6 +13,7 @@ from src.db import actualizar_estado_dni, obtener_pendiente_por_dni, obtener_pen
 from src.scraper import (
     FILTER_LIST_URL,
     FILTER_URL,
+    FiltroSinConfirmarError,
     abrir_pagina,
     dnis_con_filtro_correcto,
     filtrar_dni,
@@ -38,6 +40,8 @@ def encontrar_brave():
 
 
 async def iniciar_sesion(page, browser):
+    if MENU_PATTERN.search(page.url):
+        return page
     await page.goto(LOGIN_URL, wait_until="domcontentloaded")
     if MENU_PATTERN.search(page.url):
         return page
@@ -83,6 +87,154 @@ async def iniciar_sesion(page, browser):
     raise TimeoutError(f"No se completo el acceso a Fuvex en {espera_google} s. Pestanas abiertas: {urls}")
 
 
+async def abrir_modulo_desde_menu(page, browser, ruta_esperada):
+    """Intenta abrir un módulo desde los enlaces que expone el menú autenticado."""
+    elementos = await page.locator("a[href], button[onclick], [role='menuitem']").evaluate_all(
+        "els => els.map((e, i) => ({index: i, href: e.getAttribute('href') || '', "
+        "onclick: e.getAttribute('onclick') || '', text: (e.innerText || '').trim(), "
+        "title: e.getAttribute('title') || '', target: e.getAttribute('target') || ''}))"
+    )
+    elementos = [
+        item for item in elementos
+        if item["href"] or item["onclick"] or item["text"] or item["title"]
+    ]
+    ruta = ruta_esperada.lower()
+    coincidencias = [
+        item for item in elementos
+        if ruta in (item["href"] + " " + item["onclick"]).lower()
+    ]
+    errores_clic = []
+    descripcion = [
+        f"{item['text'] or item['title'] or '(sin texto)'} -> "
+        f"{item['href'] or item['onclick']} [target={item['target'] or '_self'}]"
+        for item in elementos[:30]
+    ]
+
+    for item in coincidencias:
+        locator = page.locator(
+            f"a[href*='{ruta}' i], button[onclick*='{ruta}' i], "
+            f"[role='menuitem'][href*='{ruta}' i]"
+        ).first
+        if not await locator.count():
+            # Fallback para entradas cuyo destino se guarda en un atributo no estándar.
+            locator = page.locator(
+                "a[href], button[onclick], [role='menuitem']"
+            ).nth(item["index"])
+        try:
+            visible = await locator.is_visible()
+        except Exception:
+            visible = False
+
+        if not visible and ("ingresar_filtro.php" in ruta or "lista_filtros_f.php" in ruta):
+            seccion_filtros = page.locator("a[href='#Filtros']").first
+            try:
+                if await seccion_filtros.count() and await seccion_filtros.is_visible():
+                    await seccion_filtros.click(timeout=5000)
+                    await locator.wait_for(state="visible", timeout=5000)
+            except Exception as exc:
+                errores_clic.append(f"no se pudo expandir Filtros: {exc}")
+
+        paginas_antes = set(browser.pages)
+        try:
+            await locator.click(timeout=5000)
+        except Exception as exc:
+            errores_clic.append(
+                f"{item['href'] or item['onclick']}: {exc}"
+            )
+            continue
+        for _ in range(20):
+            for frame in page.frames:
+                if ruta in frame.url.lower():
+                    return frame, descripcion
+            for candidate in browser.pages:
+                if ruta in candidate.url.lower():
+                    return candidate, descripcion
+            nuevas = [candidate for candidate in browser.pages if candidate not in paginas_antes]
+            for candidate in nuevas:
+                try:
+                    await candidate.wait_for_load_state("domcontentloaded", timeout=1000)
+                except Exception:
+                    pass
+                if ruta in candidate.url.lower():
+                    return candidate, descripcion
+            if ruta in page.url.lower():
+                return page, descripcion
+            await page.wait_for_timeout(500)
+
+    if coincidencias:
+        errores_clic.append(
+            f"se encontró {len(coincidencias)} enlace(s), pero no se observó "
+            "la ruta esperada en la pestaña, un popup ni un iframe"
+        )
+    return None, descripcion + errores_clic
+
+
+async def limpiar_pestanas_fuvex(browser, conservar=()):
+    """Cierra pestañas antiguas de Fuvex/Google, sin tocar otras páginas del usuario."""
+    conservar_ids = {
+        id(getattr(page, "page", page) or page) for page in conservar
+    }
+    for page in list(browser.pages):
+        if id(page) in conservar_ids:
+            continue
+        host = (urlsplit(page.url).hostname or "").lower()
+        if host == "fuvexbn.a365.com.pe" or host == "accounts.google.com":
+            try:
+                await page.close()
+            except Exception:
+                pass
+
+
+async def abrir_pagina_con_sesion(page, browser, url, ruta_esperada):
+    """Abre una página de Fuvex y renueva el acceso si hubo redirección al login."""
+    ruta = ruta_esperada.lower()
+    if ruta in page.url.lower():
+        return page
+    for frame in getattr(page, "frames", []):
+        if ruta in frame.url.lower():
+            return frame
+
+    await abrir_pagina(page, url)
+    if ruta in page.url.lower():
+        return page
+    for frame in getattr(page, "frames", []):
+        if ruta in frame.url.lower():
+            return frame
+
+    if MENU_PATTERN.search(page.url):
+        modulo, enlaces = await abrir_modulo_desde_menu(page, browser, ruta_esperada)
+        if modulo:
+            return modulo
+        detalle = " | ".join(enlaces) or "el menú no expone enlaces"
+        raise RuntimeError(
+            f"Fuvex redirigio al menu y no pude abrir el módulo {ruta_esperada}. "
+            f"URL: {page.url}. Enlaces visibles: {detalle}"
+        )
+
+    print(f"[!] Fuvex redirigio a {page.url}; intentando recuperar la sesion.")
+    page = await iniciar_sesion(page, browser)
+    await abrir_pagina(page, url)
+    if ruta not in page.url.lower():
+        for frame in getattr(page, "frames", []):
+            if ruta in frame.url.lower():
+                return frame
+        if MENU_PATTERN.search(page.url):
+            modulo, enlaces = await abrir_modulo_desde_menu(
+                page, browser, ruta_esperada
+            )
+            if modulo:
+                return modulo
+            detalle = " | ".join(enlaces) or "el menú no expone enlaces"
+            raise RuntimeError(
+                f"La sesión llegó al menú, pero no se encontró el módulo "
+                f"{ruta_esperada}. Enlaces visibles: {detalle}"
+            )
+        raise RuntimeError(
+            f"No se pudo abrir {url}. URL final: {page.url}; titulo: {await page.title()}"
+        )
+    return page
+
+
 async def main():
     brave_exe = encontrar_brave()
     if brave_exe is None:
@@ -98,33 +250,73 @@ async def main():
             headless=False,
         )
         try:
-            pagina_inicio = browser.pages[0] if browser.pages else await browser.new_page()
+            paginas = list(browser.pages)
+            pagina_inicio = next(
+                (
+                    page for page in paginas
+                    if (urlsplit(page.url).hostname or "").lower()
+                    == "fuvexbn.a365.com.pe"
+                ),
+                None,
+            )
+            if pagina_inicio is None:
+                pagina_inicio = next(
+                    (
+                        page for page in paginas
+                        if (urlsplit(page.url).hostname or "").lower()
+                        != "accounts.google.com"
+                    ),
+                    None,
+                )
+            if pagina_inicio is None:
+                pagina_inicio = await browser.new_page()
+
+            await limpiar_pestanas_fuvex(browser, conservar=(pagina_inicio,))
             pagina_filtro = await iniciar_sesion(pagina_inicio, browser)
+            await limpiar_pestanas_fuvex(browser, conservar=(pagina_filtro,))
             pagina_lista = await browser.new_page()
             pagina_registro = await browser.new_page()
-            await abrir_pagina(pagina_filtro, FILTER_URL)
-            await abrir_pagina(pagina_lista, FILTER_LIST_URL)
-            await abrir_pagina(
+            pagina_filtro = await abrir_pagina_con_sesion(
+                pagina_filtro, browser, FILTER_URL, "ingresar_filtro.php"
+            )
+            pagina_lista = await abrir_pagina_con_sesion(
+                pagina_lista, browser, FILTER_LIST_URL, "lista_filtros_f.php"
+            )
+            pagina_registro = await abrir_pagina_con_sesion(
                 pagina_registro,
+                browser,
                 "https://fuvexbn.a365.com.pe:7443/BN/Registro_Prospecto_BN.php",
+                "registro_prospecto_bn.php",
+            )
+            await limpiar_pestanas_fuvex(
+                browser,
+                conservar=(pagina_filtro, pagina_lista, pagina_registro),
             )
             print("[*] Fuvex abierto en tres pestanas: filtrar, revisar lista y registrar.")
 
-            consultados_en_esta_sesion = set()
+            dnis_enviados_en_esta_sesion = set()
+            dnis_verdes_atendidos = set()
             intervalo_revision = max(30, int(os.getenv("FUVEX_INTERVAL_SECONDS", "180")))
             espera_resultado = max(300, int(os.getenv("FUVEX_RESULT_WAIT_SECONDS", "300")))
             while True:
                 try:
+                    pagina_lista = await abrir_pagina_con_sesion(
+                        pagina_lista, browser, FILTER_LIST_URL, "lista_filtros_f.php"
+                    )
                     dnis_verdes = await dnis_con_filtro_correcto(pagina_lista)
                     filas_verdes = []
                     for dni_verde in dnis_verdes:
-                        if dni_verde in consultados_en_esta_sesion:
+                        if dni_verde in dnis_verdes_atendidos:
                             continue
                         fila = obtener_pendiente_por_dni(dni_verde)
                         if fila:
                             filas_verdes.append(fila)
                         if len(filas_verdes) == 2:
                             break
+                    print(
+                        f"[*] Resultados verdes en la lista: {len(dnis_verdes)}; "
+                        f"asociados a clientes pendientes: {len(filas_verdes)}."
+                    )
                 except Exception as exc:
                     print(f"[!] No pude revisar filtros verdes existentes: {exc}")
                     filas_verdes = []
@@ -137,31 +329,61 @@ async def main():
                             "Fuvex muestra VALIDACION CORRECTO para un filtro existente. "
                             "Escribe REGISTRAR para continuar o S para omitir: ",
                         )
-                        consultados_en_esta_sesion.add(cliente_dni)
                         if decision.strip().upper() != "REGISTRAR":
+                            dnis_verdes_atendidos.add(cliente_dni)
                             continue
-                        operador = await asyncio.to_thread(
-                            input,
-                            "Ingresa la operadora confirmada por una fuente autorizada: ",
-                        )
-                        if await registrar_prospecto(
-                            pagina_registro,
-                            cliente_dni,
-                            cliente.get("nombre", ""),
-                            cliente.get("celular", ""),
-                            cliente.get("monto", ""),
-                            operador.strip(),
-                        ):
+                        operadores_validos = {
+                            "MOVISTAR": "Movistar",
+                            "ENTEL": "Entel",
+                            "CLARO": "Claro",
+                            "BITEL": "Bitel",
+                        }
+                        while True:
+                            operador_ingresado = await asyncio.to_thread(
+                                input,
+                                "Operadora confirmada (Movistar/Entel/Claro/Bitel): ",
+                            )
+                            operador = operadores_validos.get(
+                                operador_ingresado.strip().upper()
+                            )
+                            if operador:
+                                break
+                            print("[!] Ingresa una de las operadoras mostradas en FUVEX.")
+                        try:
+                            pagina_registro = await abrir_pagina_con_sesion(
+                                pagina_registro,
+                                browser,
+                                "https://fuvexbn.a365.com.pe:7443/BN/Registro_Prospecto_BN.php",
+                                "registro_prospecto_bn.php",
+                            )
+                            registrado = await registrar_prospecto(
+                                pagina_registro,
+                                cliente_dni,
+                                cliente.get("nombre", ""),
+                                cliente.get("celular", ""),
+                                cliente.get("monto", ""),
+                                operador,
+                            )
+                        except Exception as exc:
+                            print(f"[!] Fallo el formulario para DNI {cliente_dni}: {exc}")
+                            continue
+
+                        if registrado:
                             actualizar_estado_dni(cliente_dni, "registrado")
+                            dnis_verdes_atendidos.add(cliente_dni)
                             print("[*] Prospecto registrado y estado actualizado en Supabase.")
                         else:
                             print("[!] Fuvex no confirmo el registro; queda pendiente de revision.")
                     await asyncio.sleep(intervalo_revision)
-                    await abrir_pagina(pagina_lista, FILTER_LIST_URL)
+                    pagina_lista = await abrir_pagina_con_sesion(
+                        pagina_lista, browser, FILTER_LIST_URL, "lista_filtros_f.php"
+                    )
                     continue
 
                 try:
-                    clientes = obtener_pendientes(consultados_en_esta_sesion, cantidad=2)
+                    clientes = obtener_pendientes(
+                        dnis_enviados_en_esta_sesion, cantidad=2
+                    )
                 except Exception as exc:
                     if "No encuentro una columna de monto" in str(exc):
                         raise
@@ -172,20 +394,49 @@ async def main():
                 if not clientes:
                     print("[*] No hay filas validas pendientes. Revisare ambas pestanas en 3 minutos.")
                     await asyncio.sleep(intervalo_revision)
-                    await abrir_pagina(pagina_lista, FILTER_LIST_URL)
-                    await abrir_pagina(pagina_filtro, FILTER_URL)
+                    pagina_lista = await abrir_pagina_con_sesion(
+                        pagina_lista, browser, FILTER_LIST_URL, "lista_filtros_f.php"
+                    )
+                    pagina_filtro = await abrir_pagina_con_sesion(
+                        pagina_filtro, browser, FILTER_URL, "ingresar_filtro.php"
+                    )
                     continue
+
+                print(f"[*] Supabase entrego {len(clientes)} clientes pendientes validos.")
 
                 for cliente in clientes:
                     cliente_dni = str(cliente.get("dni", "")).strip()
-                    monto = cliente["monto"]
+                    try:
+                        pagina_filtro = await abrir_pagina_con_sesion(
+                            pagina_filtro, browser, FILTER_URL, "ingresar_filtro.php"
+                        )
+                    except Exception as exc:
+                        print(
+                            f"[!] No se abrio la pagina de filtro para {cliente_dni}; "
+                            f"se reintentara en el siguiente ciclo: {exc}"
+                        )
+                        break
+
                     try:
                         await filtrar_dni(pagina_filtro, cliente_dni)
                     except ValueError as exc:
-                        consultados_en_esta_sesion.add(cliente_dni)
+                        dnis_enviados_en_esta_sesion.add(cliente_dni)
                         print(f"[!] Se omitio un registro con DNI invalido: {exc}")
                         continue
-                    consultados_en_esta_sesion.add(cliente_dni)
+                    except FiltroSinConfirmarError as exc:
+                        # No reenviar este DNI en esta sesion: Fuvex pudo procesarlo,
+                        # aunque la confirmacion no haya llegado al navegador.
+                        dnis_enviados_en_esta_sesion.add(cliente_dni)
+                        print(f"[!] Resultado de filtro incierto para {cliente_dni}: {exc}")
+                        continue
+                    except Exception as exc:
+                        print(
+                            f"[!] No se completo el filtro de {cliente_dni}: {exc}. "
+                            "No se marcara como enviado; se reintentara en el siguiente ciclo."
+                        )
+                        break
+
+                    dnis_enviados_en_esta_sesion.add(cliente_dni)
                     actualizar_estado_dni(cliente_dni, "filtrado")
                     print("[*] Filtro enviado; el resultado queda en Lista_Filtros_F.")
 
@@ -198,7 +449,9 @@ async def main():
                 restante = espera_resultado - intervalo_revision
                 if restante > 0:
                     await asyncio.sleep(restante)
-                await abrir_pagina(pagina_lista, FILTER_LIST_URL)
+                pagina_lista = await abrir_pagina_con_sesion(
+                    pagina_lista, browser, FILTER_LIST_URL, "lista_filtros_f.php"
+                )
         finally:
             try:
                 await browser.close()
