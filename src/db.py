@@ -21,6 +21,19 @@ def _monto_numerico(valor):
         return 0.0
 
 
+def _celular_peruano(valor):
+    """Devuelve el celular peruano en nueve digitos o None si no es valido."""
+    texto = str(valor or "").strip()
+    if texto.endswith(".0"):
+        texto = texto[:-2]
+    digitos = re.sub(r"\D", "", texto)
+    if len(digitos) == 11 and digitos.startswith("51"):
+        digitos = digitos[2:]
+    if len(digitos) == 9 and digitos.startswith("9"):
+        return digitos
+    return None
+
+
 def obtener_pendientes(excluir_dnis=None, cantidad=2):
     """Lee hasta los mejores pendientes válidos de cada estado, mayor monto primero."""
     if cantidad <= 0:
@@ -50,15 +63,17 @@ def obtener_pendientes(excluir_dnis=None, cantidad=2):
             pagina = respuesta.data or []
             for fila in pagina:
                 dni = str(fila.get("dni", "")).strip()
-                celular = str(fila.get("celular", "")).strip()
+                celular = _celular_peruano(fila.get("celular"))
                 nombre = str(fila.get("nombre", "")).strip()
                 if (
                     re.fullmatch(r"\d{8}", dni)
-                    and celular.lower() not in {"", "none", "null"}
+                    and celular is not None
                     and nombre.lower() not in {"", "none", "null"}
                     and dni not in excluir_dnis
                 ):
                     if dni not in filas_por_dni:
+                        fila = dict(fila)
+                        fila["celular"] = celular
                         filas_por_dni[dni] = fila
                         validos_estado += 1
             if validos_estado >= cantidad:
@@ -93,8 +108,10 @@ def obtener_pendiente_por_dni(dni):
         if respuesta.data:
             fila = respuesta.data[0]
             nombre = str(fila.get("nombre", "")).strip().lower()
-            celular = str(fila.get("celular", "")).strip().lower()
-            if nombre not in {"", "none", "null"} and celular not in {"", "none", "null"}:
+            celular = _celular_peruano(fila.get("celular"))
+            if nombre not in {"", "none", "null"} and celular is not None:
+                fila = dict(fila)
+                fila["celular"] = celular
                 return fila
     return None
 

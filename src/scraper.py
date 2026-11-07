@@ -19,6 +19,18 @@ def _normalizar(texto):
     return "".join(caracter for caracter in texto if not unicodedata.combining(caracter))
 
 
+def buscar_evidencia_cliente(dni):
+    """Busca solo una evidencia individual cuyo nombre corresponda al DNI."""
+    dni = str(dni or "").strip()
+    if not re.fullmatch(r"\d{8}", dni):
+        return None
+    for extension in (".pdf", ".jpg", ".jpeg", ".png"):
+        documento = DOCUMENTOS_DIR / f"{dni}{extension}"
+        if documento.is_file():
+            return documento
+    return None
+
+
 async def abrir_pagina(page, url):
     """Navega y reintenta si Fuvex interrumpe una redireccion inicial."""
     ultimo_error = None
@@ -209,7 +221,10 @@ async def preparar_registro(page, dni, nombre, celular, monto, operador):
 
     campo_dni = await _buscar_campo(page, r"dni|documento|identidad")
     campo_nombre = await _buscar_campo(page, r"nombre")
-    campo_celular = await _buscar_campo(page, r"celular|tel.?fono|movil|phone")
+    # El formulario Fuvex identifica el primer telefono como TEL1_NUM.
+    campo_celular = await _buscar_campo(
+        page, r"celular|tel.?fono|movil|phone|tel[12]_num"
+    )
     campo_monto = await _buscar_campo(page, r"monto|importe")
     selector_operador = await _buscar_selector(page, r"operadora|operador")
     await campo_dni.fill(str(dni).strip())
@@ -221,11 +236,7 @@ async def preparar_registro(page, dni, nombre, celular, monto, operador):
     await campo_monto.fill(str(monto))
     await selector_operador.select_option(label=operador)
 
-    documentos = [
-        DOCUMENTOS_DIR / f"{dni}{extension}"
-        for extension in (".pdf", ".jpg", ".jpeg", ".png")
-    ]
-    documento = next((ruta for ruta in documentos if ruta.is_file()), None)
+    documento = buscar_evidencia_cliente(dni)
     if documento is None:
         raise FileNotFoundError(
             f"Falta la evidencia individual de este cliente en {DOCUMENTOS_DIR} "

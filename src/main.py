@@ -17,6 +17,7 @@ from src.scraper import (
     abrir_pagina,
     dnis_con_filtro_correcto,
     filtrar_dni,
+    buscar_evidencia_cliente,
     registrar_prospecto,
 )
 
@@ -40,10 +41,9 @@ def encontrar_brave():
 
 
 async def iniciar_sesion(page, browser):
-    if MENU_PATTERN.search(page.url):
-        return page
-    await page.goto(LOGIN_URL, wait_until="domcontentloaded")
-    if MENU_PATTERN.search(page.url):
+    if not MENU_PATTERN.search(page.url):
+        await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+    if MENU_PATTERN.search(page.url) and not await pagina_pide_google(page):
         return page
 
     usuario = os.getenv("FUVEX_USER")
@@ -73,7 +73,7 @@ async def iniciar_sesion(page, browser):
     # Google puede abrir otra pestaña o completar el acceso en la misma.
     for _ in range(espera_google):
         for candidate in browser.pages:
-            if MENU_PATTERN.search(candidate.url):
+            if MENU_PATTERN.search(candidate.url) and not await pagina_pide_google(candidate):
                 try:
                     await candidate.wait_for_load_state("domcontentloaded", timeout=30000)
                 except Exception:
@@ -87,86 +87,15 @@ async def iniciar_sesion(page, browser):
     raise TimeoutError(f"No se completo el acceso a Fuvex en {espera_google} s. Pestanas abiertas: {urls}")
 
 
-async def abrir_modulo_desde_menu(page, browser, ruta_esperada):
-    """Intenta abrir un módulo desde los enlaces que expone el menú autenticado."""
-    elementos = await page.locator("a[href], button[onclick], [role='menuitem']").evaluate_all(
-        "els => els.map((e, i) => ({index: i, href: e.getAttribute('href') || '', "
-        "onclick: e.getAttribute('onclick') || '', text: (e.innerText || '').trim(), "
-        "title: e.getAttribute('title') || '', target: e.getAttribute('target') || ''}))"
-    )
-    elementos = [
-        item for item in elementos
-        if item["href"] or item["onclick"] or item["text"] or item["title"]
-    ]
-    ruta = ruta_esperada.lower()
-    coincidencias = [
-        item for item in elementos
-        if ruta in (item["href"] + " " + item["onclick"]).lower()
-    ]
-    errores_clic = []
-    descripcion = [
-        f"{item['text'] or item['title'] or '(sin texto)'} -> "
-        f"{item['href'] or item['onclick']} [target={item['target'] or '_self'}]"
-        for item in elementos[:30]
-    ]
-
-    for item in coincidencias:
-        locator = page.locator(
-            f"a[href*='{ruta}' i], button[onclick*='{ruta}' i], "
-            f"[role='menuitem'][href*='{ruta}' i]"
-        ).first
-        if not await locator.count():
-            # Fallback para entradas cuyo destino se guarda en un atributo no estándar.
-            locator = page.locator(
-                "a[href], button[onclick], [role='menuitem']"
-            ).nth(item["index"])
-        try:
-            visible = await locator.is_visible()
-        except Exception:
-            visible = False
-
-        if not visible and ("ingresar_filtro.php" in ruta or "lista_filtros_f.php" in ruta):
-            seccion_filtros = page.locator("a[href='#Filtros']").first
-            try:
-                if await seccion_filtros.count() and await seccion_filtros.is_visible():
-                    await seccion_filtros.click(timeout=5000)
-                    await locator.wait_for(state="visible", timeout=5000)
-            except Exception as exc:
-                errores_clic.append(f"no se pudo expandir Filtros: {exc}")
-
-        paginas_antes = set(browser.pages)
-        try:
-            await locator.click(timeout=5000)
-        except Exception as exc:
-            errores_clic.append(
-                f"{item['href'] or item['onclick']}: {exc}"
-            )
-            continue
-        for _ in range(20):
-            for frame in page.frames:
-                if ruta in frame.url.lower():
-                    return frame, descripcion
-            for candidate in browser.pages:
-                if ruta in candidate.url.lower():
-                    return candidate, descripcion
-            nuevas = [candidate for candidate in browser.pages if candidate not in paginas_antes]
-            for candidate in nuevas:
-                try:
-                    await candidate.wait_for_load_state("domcontentloaded", timeout=1000)
-                except Exception:
-                    pass
-                if ruta in candidate.url.lower():
-                    return candidate, descripcion
-            if ruta in page.url.lower():
-                return page, descripcion
-            await page.wait_for_timeout(500)
-
-    if coincidencias:
-        errores_clic.append(
-            f"se encontró {len(coincidencias)} enlace(s), pero no se observó "
-            "la ruta esperada en la pestaña, un popup ni un iframe"
-        )
-    return None, descripcion + errores_clic
+async def pagina_pide_google(page):
+    """Detecta el menu que aun requiere completar el acceso mediante Google."""
+    if (urlsplit(page.url).hostname or "").lower() == "accounts.google.com":
+        return True
+    boton = page.get_by_text(re.compile(r"Iniciar sesi.n con Google", re.I)).first
+    try:
+        return await boton.count() > 0 and await boton.is_visible()
+    except Exception:
+        return False
 
 
 async def limpiar_pestanas_fuvex(browser, conservar=()):
@@ -202,6 +131,8 @@ async def abrir_pagina_con_sesion(page, browser, url, ruta_esperada):
             return frame
 
     if MENU_PATTERN.search(page.url):
+        if await pagina_pide_google(page):
+            page = await iniciar_sesion(page, browser)
         modulo, enlaces = await abrir_modulo_desde_menu(page, browser, ruta_esperada)
         if modulo:
             return modulo
@@ -219,6 +150,8 @@ async def abrir_pagina_con_sesion(page, browser, url, ruta_esperada):
             if ruta in frame.url.lower():
                 return frame
         if MENU_PATTERN.search(page.url):
+            if await pagina_pide_google(page):
+                page = await iniciar_sesion(page, browser)
             modulo, enlaces = await abrir_modulo_desde_menu(
                 page, browser, ruta_esperada
             )
@@ -233,6 +166,98 @@ async def abrir_pagina_con_sesion(page, browser, url, ruta_esperada):
             f"No se pudo abrir {url}. URL final: {page.url}; titulo: {await page.title()}"
         )
     return page
+
+
+async def abrir_modulo_desde_menu(page, browser, ruta_esperada, _reintento_google=False):
+    """Abre el enlace del menu aunque viva en otra pestana o dentro de un frame."""
+    ruta = ruta_esperada.lower()
+    selector = "a[href], button[onclick], [role='menuitem']"
+    metadata_js = """els => els.map((e, i) => ({index: i,
+        href: e.getAttribute('href') || '', absoluteHref: e.href || '',
+        onclick: e.getAttribute('onclick') || '', text: (e.innerText || '').trim(),
+        title: e.getAttribute('title') || '', target: e.getAttribute('target') || ''}))"""
+    descripciones, errores = [], []
+
+    contextos = []
+    for candidate in list(browser.pages):
+        contextos.append(candidate)
+        contextos.extend(candidate.frames)
+    contextos.extend(getattr(page, "frames", []))
+    contextos = list({id(ctx): ctx for ctx in contextos}.values())
+
+    for contexto in contextos:
+        try:
+            elementos = await contexto.locator(selector).evaluate_all(metadata_js)
+        except Exception:
+            continue
+        coincidencias = [e for e in elementos if ruta in (
+            e['href'] + ' ' + e['absoluteHref'] + ' ' + e['onclick']
+        ).lower()]
+        if not coincidencias:
+            continue
+        descripciones.extend(
+            f"{e['text'] or e['title'] or '(sin texto)'} -> "
+            f"{e['href'] or e['onclick']} [target={e['target'] or '_self'}]"
+            for e in elementos[:30]
+        )
+
+        for item in coincidencias:
+            locator = contexto.locator(
+                f"a[href*='{ruta}' i], button[onclick*='{ruta}' i], "
+                f"[role='menuitem'][href*='{ruta}' i]"
+            ).first
+            if not await locator.count():
+                locator = contexto.locator(selector).nth(item['index'])
+            try:
+                if not await locator.is_visible() and ('ingresar_filtro.php' in ruta or 'lista_filtros_f.php' in ruta):
+                    seccion = contexto.locator("a[href='#Filtros']").first
+                    if await seccion.count() and await seccion.is_visible():
+                        await seccion.click(timeout=5000)
+                    await locator.wait_for(state='visible', timeout=5000)
+                antes = set(browser.pages)
+                await locator.click(timeout=10000)
+            except Exception as exc:
+                errores.append(f"{item['href'] or item['onclick']}: {exc}")
+                continue
+
+            vio_google = False
+            timeout = 30
+            inicio_espera = asyncio.get_running_loop().time()
+            while asyncio.get_running_loop().time() - inicio_espera < timeout:
+                for candidate in list(browser.pages):
+                    if ruta in candidate.url.lower():
+                        return candidate, list(dict.fromkeys(descripciones))
+                    for frame in candidate.frames:
+                        if ruta in frame.url.lower():
+                            return frame, list(dict.fromkeys(descripciones))
+                    if (urlsplit(candidate.url).hostname or "").lower() == "accounts.google.com":
+                        if not vio_google:
+                            print("[*] Google solicita confirmar la cuenta en Brave; esperando el retorno a Fuvex.")
+                            vio_google = True
+                            timeout = max(60, int(os.getenv("GOOGLE_LOGIN_TIMEOUT_SECONDS", "600")))
+                for candidate in browser.pages:
+                    if candidate not in antes and ruta in candidate.url.lower():
+                        return candidate, list(dict.fromkeys(descripciones))
+                if vio_google and not _reintento_google:
+                    menu = None
+                    for candidate in browser.pages:
+                        if (
+                            MENU_PATTERN.search(candidate.url)
+                            and not await pagina_pide_google(candidate)
+                        ):
+                            menu = candidate
+                            break
+                    if menu:
+                        return await abrir_modulo_desde_menu(
+                            menu, browser, ruta_esperada, _reintento_google=True
+                        )
+                await asyncio.sleep(0.5)
+            urls = ', '.join(candidate.url for candidate in browser.pages)
+            errores.append(f"el enlace se pulso, pero no aparecio {ruta_esperada}; pestanas: {urls}")
+
+    if not descripciones:
+        descripciones.append('No encontre el enlace en ninguna pestana o frame de Fuvex.')
+    return None, list(dict.fromkeys(descripciones + errores))
 
 
 async def main():
@@ -296,6 +321,7 @@ async def main():
 
             dnis_enviados_en_esta_sesion = set()
             dnis_verdes_atendidos = set()
+            dnis_sin_evidencia_reportados = set()
             intervalo_revision = max(30, int(os.getenv("FUVEX_INTERVAL_SECONDS", "180")))
             espera_resultado = max(300, int(os.getenv("FUVEX_RESULT_WAIT_SECONDS", "300")))
             while True:
@@ -324,6 +350,17 @@ async def main():
                 if filas_verdes:
                     for cliente in filas_verdes:
                         cliente_dni = str(cliente["dni"]).strip()
+                        if buscar_evidencia_cliente(cliente_dni) is None:
+                            if cliente_dni not in dnis_sin_evidencia_reportados:
+                                print(
+                                    f"[!] DNI {cliente_dni}: falta su evidencia individual en "
+                                    "assets/documentos/{DNI}.pdf/.jpg/.jpeg/.png. "
+                                    "assets/documento_requerido.jpeg no corresponde a este cliente; "
+                                    "se omitira el registro."
+                                )
+                                dnis_sin_evidencia_reportados.add(cliente_dni)
+                            continue
+                        dnis_sin_evidencia_reportados.discard(cliente_dni)
                         decision = await asyncio.to_thread(
                             input,
                             "Fuvex muestra VALIDACION CORRECTO para un filtro existente. "
@@ -369,9 +406,15 @@ async def main():
                             continue
 
                         if registrado:
-                            actualizar_estado_dni(cliente_dni, "registrado")
                             dnis_verdes_atendidos.add(cliente_dni)
-                            print("[*] Prospecto registrado y estado actualizado en Supabase.")
+                            try:
+                                actualizar_estado_dni(cliente_dni, "registrado")
+                                print("[*] Prospecto registrado y estado actualizado en Supabase.")
+                            except Exception as exc:
+                                print(
+                                    f"[!] El prospecto {cliente_dni} se registro en Fuvex, "
+                                    f"pero no pude actualizar Supabase: {exc}"
+                                )
                         else:
                             print("[!] Fuvex no confirmo el registro; queda pendiente de revision.")
                     await asyncio.sleep(intervalo_revision)
@@ -437,7 +480,13 @@ async def main():
                         break
 
                     dnis_enviados_en_esta_sesion.add(cliente_dni)
-                    actualizar_estado_dni(cliente_dni, "filtrado")
+                    try:
+                        actualizar_estado_dni(cliente_dni, "filtrado")
+                    except Exception as exc:
+                        print(
+                            f"[!] Fuvex recibio el filtro de {cliente_dni}, pero no pude "
+                            f"actualizar Supabase: {exc}. No lo reenviere en esta sesion."
+                        )
                     print("[*] Filtro enviado; el resultado queda en Lista_Filtros_F.")
 
                 print(
