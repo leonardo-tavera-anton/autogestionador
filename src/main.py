@@ -18,6 +18,9 @@ from src.scraper import (
     ClienteOmitidoError,
     FiltroSinConfirmarError,
     FiltrosNoDisponiblesError,
+    RegistroRechazadoError,
+    RegistroSinConfirmarError,
+    SesionFuvexExpiradaError,
     abrir_pagina,
     dnis_con_filtro_correcto,
     filtrar_dni,
@@ -117,8 +120,17 @@ async def limpiar_pestanas_fuvex(browser, conservar=()):
                 pass
 
 
-async def abrir_pagina_con_sesion(page, browser, url, ruta_esperada, recargar=False):
+async def _abrir_pagina_con_sesion(page, browser, url, ruta_esperada, recargar=False):
     """Abre una página de Fuvex y renueva el acceso si hubo redirección al login."""
+    if page.is_closed():
+        try:
+            page = await browser.new_page()
+        except Exception as exc:
+            raise RuntimeError(
+                "La pestaña se cerro y no se pudo abrir otra. "
+                "Comprueba si Brave sigue abierto."
+            ) from exc
+
     ruta = ruta_esperada.lower()
     if not recargar and ruta in page.url.lower():
         return page
@@ -172,7 +184,43 @@ async def abrir_pagina_con_sesion(page, browser, url, ruta_esperada, recargar=Fa
     return page
 
 
-async def enviar_filtro_con_espera(page, browser, dni):
+async def abrir_pagina_con_sesion(
+    page, browser, url, ruta_esperada, recargar=False, session_lock=None
+):
+    if session_lock is None:
+        return await _abrir_pagina_con_sesion(
+            page, browser, url, ruta_esperada, recargar
+        )
+    async with session_lock:
+        return await _abrir_pagina_con_sesion(
+            page, browser, url, ruta_esperada, recargar
+        )
+
+
+def crear_limitador_envios(intervalo_minimo, tipo_envio):
+    """Espacia los envios de un solo tipo sin mezclar ambos ciclos."""
+    lock = asyncio.Lock()
+    estado: dict[str, float | None] = {"ultimo_envio": None}
+
+    async def esperar_turno():
+        async with lock:
+            loop = asyncio.get_running_loop()
+            ultimo_envio = estado["ultimo_envio"]
+            if ultimo_envio is not None:
+                espera = intervalo_minimo - (loop.time() - ultimo_envio)
+                if espera > 0:
+                    print(
+                        f"[*] Pausa de {espera:.0f} segundos antes del {tipo_envio}."
+                    )
+                    await asyncio.sleep(espera)
+            estado["ultimo_envio"] = loop.time()
+
+    return esperar_turno
+
+
+async def enviar_filtro_con_espera(
+    page, browser, dni, session_lock=None, antes_de_enviar=None
+):
     """Reintenta el mismo DNI cada minuto si la cola de Fuvex esta llena."""
     while True:
         print(f"[*] Recargando el formulario antes del filtro para {dni}.")
@@ -182,9 +230,10 @@ async def enviar_filtro_con_espera(page, browser, dni):
             FILTER_URL,
             "ingresar_filtro.php",
             recargar=True,
+            session_lock=session_lock,
         )
         try:
-            await filtrar_dni(page, dni)
+            await filtrar_dni(page, dni, antes_de_enviar)
             return page
         except ColaEsperaLlenaError as exc:
             print(
@@ -235,13 +284,20 @@ async def abrir_modulo_desde_menu(page, browser, ruta_esperada, _reintento_googl
             if not await locator.count():
                 locator = contexto.locator(selector).nth(item['index'])
             try:
-                if not await locator.is_visible() and ('ingresar_filtro.php' in ruta or 'lista_filtros_f.php' in ruta):
-                    seccion = contexto.locator("a[href='#Filtros']").first
-                    if await seccion.count() and await seccion.is_visible():
-                        await seccion.click(timeout=5000)
-                    await locator.wait_for(state='visible', timeout=5000)
                 antes = set(browser.pages)
-                await locator.click(timeout=10000)
+                if await locator.is_visible():
+                    await locator.click(timeout=10000)
+                else:
+                    if "ingresar_filtro.php" in ruta or "lista_filtros_f.php" in ruta:
+                        seccion = contexto.locator("a[href='#Filtros']").first
+                        if await seccion.count() and await seccion.is_visible():
+                            await seccion.click(timeout=5000)
+                    try:
+                        await locator.wait_for(state="visible", timeout=1500)
+                        await locator.click(timeout=10000)
+                    except Exception:
+                        # El elemento puede seguir oculto dentro de un menu colapsado.
+                        await locator.evaluate("(elemento) => elemento.click()")
             except Exception as exc:
                 errores.append(f"{item['href'] or item['onclick']}: {exc}")
                 continue
@@ -294,13 +350,19 @@ async def proceso_registros(
     intervalo_revision,
     dnis_aprobados,
     registro_inicializado,
+    session_lock,
+    antes_de_enviar,
 ):
     """Revisa aprobados y registra prospectos de forma independiente."""
     dnis_verdes_atendidos = set()
     while True:
         try:
             pagina_lista = await abrir_pagina_con_sesion(
-                pagina_lista, browser, FILTER_LIST_URL, "lista_filtros_f.php"
+                pagina_lista,
+                browser,
+                FILTER_LIST_URL,
+                "lista_filtros_f.php",
+                session_lock=session_lock,
             )
             dnis_verdes = await dnis_con_filtro_correcto(pagina_lista)
             dnis_aprobados.update(dnis_verdes)
@@ -354,6 +416,7 @@ async def proceso_registros(
                     browser,
                     "https://fuvexbn.a365.com.pe:7443/BN/Registro_Prospecto_BN.php",
                     "registro_prospecto_bn.php",
+                    session_lock=session_lock,
                 )
                 registrado = await registrar_prospecto(
                     pagina_registro,
@@ -361,10 +424,27 @@ async def proceso_registros(
                     cliente.get("nombre", ""),
                     cliente.get("celular", ""),
                     operador,
+                    antes_de_enviar,
                 )
             except ClienteOmitidoError as exc:
                 dnis_verdes_atendidos.add(dni)
                 print(f"[*] Se omite el DNI {dni} y se continua: {exc}")
+                continue
+            except RegistroRechazadoError as exc:
+                print(f"[!] {exc}; se revisara de nuevo en el siguiente ciclo.")
+                continue
+            except SesionFuvexExpiradaError as exc:
+                print(
+                    f"[!] {exc} Se pausara el registro; completa la autenticacion "
+                    "en Brave y se volvera a revisar en el siguiente ciclo."
+                )
+                break
+            except RegistroSinConfirmarError as exc:
+                dnis_verdes_atendidos.add(dni)
+                print(
+                    f"[!] {exc}. No lo reintentare durante esta ejecucion para "
+                    "evitar un posible registro duplicado; verifica el resultado en Fuvex."
+                )
                 continue
             except Exception as exc:
                 print(f"[!] Fallo el registro del DNI {dni}: {exc}")
@@ -456,6 +536,19 @@ async def main():
             intervalo_revision = max(30, int(os.getenv("FUVEX_INTERVAL_SECONDS", "60")))
             dnis_aprobados = set()
             registro_inicializado = asyncio.Event()
+            session_lock = asyncio.Lock()
+            intervalo_entre_filtros = max(
+                10.0, float(os.getenv("FUVEX_FILTER_DELAY_SECONDS", "15"))
+            )
+            intervalo_entre_registros = max(
+                60.0, float(os.getenv("FUVEX_REGISTRATION_DELAY_SECONDS", "60"))
+            )
+            esperar_filtro = crear_limitador_envios(
+                intervalo_entre_filtros, "filtro"
+            )
+            esperar_registro = crear_limitador_envios(
+                intervalo_entre_registros, "registro"
+            )
             proceso_registro = asyncio.create_task(
                 proceso_registros(
                     pagina_lista,
@@ -465,10 +558,13 @@ async def main():
                     intervalo_revision,
                     dnis_aprobados,
                     registro_inicializado,
+                    session_lock,
+                    esperar_registro,
                 )
             )
             print("[*] Proceso de registro ejecutandose en paralelo al filtrado.")
             await registro_inicializado.wait()
+            fallos_navegacion = 0
             while True:
                 try:
                     clientes = await asyncio.to_thread(
@@ -495,9 +591,15 @@ async def main():
                     cliente_dni = str(cliente.get("dni", "")).strip()
                     try:
                         pagina_filtro = await enviar_filtro_con_espera(
-                            pagina_filtro, browser, cliente_dni
+                            pagina_filtro,
+                            browser,
+                            cliente_dni,
+                            session_lock,
+                            esperar_filtro,
                         )
+                        fallos_navegacion = 0
                     except ClienteOmitidoError as exc:
+                        fallos_navegacion = 0
                         dnis_enviados_en_esta_sesion.add(cliente_dni)
                         print(
                             f"[*] Se omite el DNI {cliente_dni} y se continua con el "
@@ -505,6 +607,7 @@ async def main():
                         )
                         continue
                     except FiltrosNoDisponiblesError as exc:
+                        fallos_navegacion = 0
                         pausa_por_filtros_agotados = True
                         print(
                             f"[!] Fuvex no acepta mas filtros por ahora. Se pausa "
@@ -512,18 +615,39 @@ async def main():
                         )
                         break
                     except ValueError as exc:
+                        fallos_navegacion = 0
                         dnis_enviados_en_esta_sesion.add(cliente_dni)
                         print(f"[!] Se omitio un registro con DNI invalido: {exc}")
                         continue
                     except FiltroSinConfirmarError as exc:
+                        fallos_navegacion = 0
                         dnis_enviados_en_esta_sesion.add(cliente_dni)
                         print(f"[!] Resultado de filtro incierto para {cliente_dni}: {exc}")
                         continue
                     except Exception as exc:
+                        fallos_navegacion += 1
+                        intento_cerrado = (
+                            "Target page, context or browser has been closed"
+                            in str(exc)
+                        )
+                        if intento_cerrado and pagina_filtro.is_closed():
+                            try:
+                                pagina_filtro = await browser.new_page()
+                            except Exception as error_pestana:
+                                raise RuntimeError(
+                                    "Brave o su contexto de automatizacion se cerro. "
+                                    "Reabre Brave y reinicia el programa."
+                                ) from error_pestana
                         print(
                             f"[!] No se abrio la pagina de filtro para {cliente_dni}; "
                             f"se reintentara en el siguiente ciclo: {exc}"
                         )
+                        espera = min(30 * (2 ** min(fallos_navegacion - 1, 4)), 480)
+                        print(
+                            f"[*] Pausa de {espera} segundos antes de volver a "
+                            "consultar Fuvex."
+                        )
+                        await asyncio.sleep(espera)
                         break
                     dnis_enviados_en_esta_sesion.add(cliente_dni)
                     try:

@@ -1,7 +1,9 @@
 import re
 import unicodedata
 from datetime import date
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from playwright.async_api import Error as PlaywrightError
 
@@ -27,6 +29,18 @@ class FiltrosNoDisponiblesError(RuntimeError):
 
 class ColaEsperaLlenaError(RuntimeError):
     """Fuvex rechaza el filtro porque la cola de espera alcanzo su limite."""
+
+
+class RegistroSinConfirmarError(RuntimeError):
+    """Fuvex no mostro una respuesta verificable luego del registro."""
+
+
+class RegistroRechazadoError(RuntimeError):
+    """Fuvex rechazo el registro y mostro un mensaje de error."""
+
+
+class SesionFuvexExpiradaError(RuntimeError):
+    """Fuvex devolvio al inicio de sesion durante una operacion."""
 
 
 _CLIENTE_OMITIDO_RE = re.compile(
@@ -84,6 +98,56 @@ async def _avisos_visibles(page):
     return await avisos.all_inner_texts()
 
 
+async def _aceptar_confirmacion_exito(page):
+    selectores_modal = ".swal2-popup:visible, [role='dialog']:visible, .modal:visible"
+    modal = page.locator(selectores_modal).last
+    modal_visible = await modal.count() > 0
+    selector_botones = (
+        "button:visible, [role='button']:visible, "
+        "input[type='button']:visible, a:visible"
+    )
+    botones = modal.locator(selector_botones) if modal_visible else page.locator(selector_botones)
+    etiquetas = await botones.evaluate_all(
+        "els => els.map(e => (e.innerText || e.value || "
+        "e.getAttribute('aria-label') || '').trim())"
+    )
+    indice_ok = next(
+        (
+            indice
+            for indice, etiqueta in enumerate(etiquetas)
+            if re.fullmatch(r"(?:OK|ACEPTAR|CONTINUAR)", etiqueta, re.I)
+        ),
+        None,
+    )
+    if indice_ok is None:
+        if modal_visible:
+            raise RuntimeError(
+                "Fuvex mostro la confirmacion de registro, pero no encontre "
+                "un boton visible OK/Aceptar para cerrarla."
+            )
+        return False
+
+    boton_ok = botones.nth(indice_ok)
+    try:
+        await boton_ok.click(force=True, timeout=5000)
+    except PlaywrightError as exc:
+        try:
+            await boton_ok.evaluate("(elemento) => elemento.click()")
+        except PlaywrightError as fallback_exc:
+            raise RuntimeError(
+                "No pude pulsar el boton OK/Aceptar de la confirmacion de Fuvex."
+            ) from fallback_exc
+
+    if modal_visible:
+        try:
+            await modal.wait_for(state="hidden", timeout=5000)
+        except PlaywrightError as exc:
+            raise RuntimeError(
+                "Se pulso OK/Aceptar, pero la confirmacion de Fuvex sigue visible."
+            ) from exc
+    return True
+
+
 async def abrir_pagina(page, url):
     """Navega y reintenta si Fuvex interrumpe una redireccion inicial."""
     ultimo_error = None
@@ -118,22 +182,6 @@ async def _buscar_campo(page, patron):
     return page.locator("input").nth(campo["index"])
 
 
-async def _buscar_selector(page, patron):
-    selectores = await page.locator("select").evaluate_all(
-        "els => els.map((e, i) => ({index: i, meta: [e.name, e.id, e.getAttribute('aria-label'), ...(e.labels ? Array.from(e.labels).map(l => l.innerText) : [])].filter(Boolean).join(' ')}))"
-    )
-    selector = next(
-        (item for item in selectores if re.search(patron, item["meta"], re.I)),
-        None,
-    )
-    if selector is None:
-        detalle = ", ".join(item["meta"] or "sin etiqueta" for item in selectores)
-        raise RuntimeError(
-            f"No encontre el selector ({patron}). Selectores disponibles: {detalle or 'ninguno'}"
-        )
-    return page.locator("select").nth(selector["index"])
-
-
 async def _selector_por_id(page, identificador):
     selector = page.locator(f"#{identificador}")
     if not await selector.count():
@@ -148,16 +196,88 @@ async def _establecer_valor_por_id(page, identificador, valor):
     etiqueta = await campo.evaluate("(el) => el.tagName.toLowerCase()")
     if etiqueta == "select":
         opciones = await campo.locator("option").evaluate_all(
-            "els => els.map(e => e.value)"
+            "els => els.map(e => ({value: e.value, text: (e.textContent || '').trim()}))"
         )
-        if valor not in opciones:
+        opcion = next(
+            (item for item in opciones if item["value"] == valor),
+            next(
+                (item for item in opciones if item["text"] == valor),
+                None,
+            ),
+        )
+        if opcion is not None:
+            await campo.select_option(value=opcion["value"])
+        else:
             raise RuntimeError(
                 f"El selector #{identificador} no ofrece el valor esperado: {valor}."
             )
-        await campo.select_option(value=valor)
     else:
         await campo.fill(valor)
     return campo
+
+
+async def _seleccionar_menor_tasa(page):
+    selector = await _selector_por_id(page, "TASA")
+    firma_anterior = None
+    muestras_estables = 0
+    opciones = []
+    for _ in range(24):
+        opciones = await selector.locator("option").evaluate_all(
+            "els => els.map(e => ({value: e.value, text: (e.textContent || '').trim()}))"
+        )
+        firma_actual = tuple((item["value"], item["text"]) for item in opciones)
+        if firma_actual == firma_anterior:
+            muestras_estables += 1
+            if muestras_estables >= 3:
+                break
+        else:
+            firma_anterior = firma_actual
+            muestras_estables = 0
+        await page.wait_for_timeout(250)
+
+    tasas = []
+    for opcion in opciones:
+        if not opcion["value"]:
+            continue
+        coincidencia = re.fullmatch(
+            r"\s*(\d+(?:[.,]\d+)?)\s*%?\s*", opcion["text"]
+        )
+        if coincidencia is None:
+            continue
+        try:
+            tasa = Decimal(coincidencia.group(1).replace(",", "."))
+        except InvalidOperation:
+            continue
+        tasas.append((tasa, opcion))
+    if not tasas:
+        opciones_disponibles = ", ".join(
+            opcion["text"] or opcion["value"] or "(vacia)"
+            for opcion in opciones
+        )
+        raise RuntimeError(
+            "No encontre tasas numericas seleccionables en #TASA. "
+            f"Opciones visibles: {opciones_disponibles or 'ninguna'}"
+        )
+
+    tasa_menor, opcion_menor = min(tasas, key=lambda item: item[0])
+    for _ in range(3):
+        await selector.select_option(value=opcion_menor["value"])
+        await page.wait_for_timeout(250)
+        seleccionada = await selector.locator("option:checked").evaluate(
+            "e => ({value: e.value, text: (e.textContent || '').trim()})"
+        )
+        tasa_visible = re.fullmatch(
+            r"\s*(\d+(?:[.,]\d+)?)\s*%?\s*", seleccionada["text"]
+        )
+        if (
+            seleccionada["value"] == opcion_menor["value"]
+            and tasa_visible is not None
+            and Decimal(tasa_visible.group(1).replace(",", ".")) == tasa_menor
+        ):
+            return tasa_menor
+    raise RuntimeError(
+        f"No se pudo mantener seleccionada la tasa minima {tasa_menor} en #TASA."
+    )
 
 
 async def dnis_con_filtro_correcto(page):
@@ -242,7 +362,7 @@ async def dnis_con_filtro_correcto(page):
     return encontrados
 
 
-async def filtrar_dni(page, dni):
+async def filtrar_dni(page, dni, antes_de_enviar=None):
     dni = str(dni).strip()
     if not re.fullmatch(r"\d{8}", dni):
         raise ValueError("El registro no contiene un DNI valido de 8 digitos.")
@@ -270,6 +390,8 @@ async def filtrar_dni(page, dni):
 
     avisos_anteriores = set(await _avisos_visibles(page))
     try:
+        if antes_de_enviar is not None:
+            await antes_de_enviar()
         await page.locator(selector_botones).nth(accion["index"]).click()
     except PlaywrightError as exc:
         raise FiltroSinConfirmarError(
@@ -358,12 +480,10 @@ async def preparar_registro(page, dni, nombre, celular, operador):
         "ESTADO_REGISTRO": "INTERESADO",
         "MONTO": "90000",
         "PLAZO": "60",
-        "TASA": "9.99",
         "CANAL": "PRESENCIAL",
     }
     for identificador, valor in valores_fijos.items():
         await _establecer_valor_por_id(page, identificador, valor)
-
     interaccion = await _selector_por_id(page, "TITULO_M")
     opciones_interaccion = await interaccion.locator("option").evaluate_all(
         "els => els.map(e => ({value: e.value, text: (e.textContent || '').trim()}))"
@@ -385,10 +505,6 @@ async def preparar_registro(page, dni, nombre, celular, operador):
     fecha_visita = await _selector_por_id(page, "FECHA_VISITA")
     await fecha_visita.fill(fecha_estimada_visita().isoformat())
 
-    comentarios = await _selector_por_id(page, "COMENTARIOS")
-    if not (await comentarios.input_value()).strip():
-        await comentarios.fill("Ingreso automático")
-
     if not EVIDENCIA_REQUERIDA.is_file():
         raise FileNotFoundError(
             f"No se encontro la evidencia requerida: {EVIDENCIA_REQUERIDA}"
@@ -397,9 +513,18 @@ async def preparar_registro(page, dni, nombre, celular, operador):
     if not await campo_archivo.count():
         raise RuntimeError("El formulario no muestra un campo para adjuntar evidencias.")
     await campo_archivo.set_input_files(str(EVIDENCIA_REQUERIDA))
+    archivos_adjuntos = await campo_archivo.evaluate(
+        "el => Array.from(el.files || []).map(file => file.name)"
+    )
+    if EVIDENCIA_REQUERIDA.name not in archivos_adjuntos:
+        raise RuntimeError(
+            f"No se confirmo el adjunto de {EVIDENCIA_REQUERIDA.name}."
+        )
 
 
-async def registrar_prospecto(page, dni, nombre, celular, operador):
+async def registrar_prospecto(
+    page, dni, nombre, celular, operador, antes_de_enviar=None
+):
     await preparar_registro(page, dni, nombre, celular, operador)
     selector = "button:visible, a:visible, input[type='submit']:visible"
     acciones = await page.locator(selector).evaluate_all(
@@ -413,17 +538,84 @@ async def registrar_prospecto(page, dni, nombre, celular, operador):
         opciones = ", ".join(item["text"] or "sin texto" for item in acciones)
         raise RuntimeError(f"No encontre el boton Registrar. Acciones: {opciones or 'ninguna'}")
 
-    await page.locator(selector).nth(accion["index"]).click()
-    await page.wait_for_timeout(1500)
+    tasa_seleccionada = await _seleccionar_menor_tasa(page)
+    selector_tasa = await _selector_por_id(page, "TASA")
+    etiqueta_tasa = await selector_tasa.locator("option:checked").inner_text()
+    if Decimal(etiqueta_tasa.strip().replace(",", ".")) != tasa_seleccionada:
+        raise RuntimeError(
+            f"La tasa visible {etiqueta_tasa} no coincide con la minima "
+            f"{tasa_seleccionada}; no se enviara el registro."
+        )
+    print(f"[*] Tasa menor seleccionada y verificada: {etiqueta_tasa}.")
+    if antes_de_enviar is not None:
+        await antes_de_enviar()
+
+    dialogos = []
+
+    async def aceptar_dialogo(dialogo):
+        dialogos.append(dialogo.message)
+        await dialogo.accept()
+
+    page.on("dialog", aceptar_dialogo)
+    try:
+        await page.locator(selector).nth(accion["index"]).click()
+        await page.wait_for_timeout(1500)
+    finally:
+        page.remove_listener("dialog", aceptar_dialogo)
+
+    host = (urlsplit(page.url).hostname or "").lower()
+    ruta = urlsplit(page.url).path.lower()
+    campo_login = page.locator("#USUARIO")
+    if (
+        host == "accounts.google.com"
+        or (host == "fuvexbn.a365.com.pe" and ruta.endswith("/index.php"))
+        or (await campo_login.count() and await campo_login.is_visible())
+    ):
+        raise SesionFuvexExpiradaError(
+            f"Fuvex devolvio al inicio de sesion al intentar registrar {dni}; "
+            "el envio no se puede confirmar."
+        )
+
     texto = _normalizar(await page.locator("body").inner_text())
     avisos = await _avisos_visibles(page)
-    mensaje = next((aviso for aviso in avisos if _cliente_omitido(aviso)), None)
-    if mensaje:
-        raise ClienteOmitidoError(re.sub(r"\s+", " ", mensaje).strip())
-    if _cliente_omitido(texto) and not any(
-        indicador in texto for indicador in ("REGISTRADO", "GUARDADO", "EXITO")
-    ):
+    respuesta = _normalizar(" ".join([*dialogos, *avisos, texto]))
+    mensaje = next(
+        (aviso for aviso in avisos if _cliente_omitido(aviso)),
+        None,
+    )
+    if mensaje or (_cliente_omitido(respuesta) and not any(
+        indicador in respuesta
+        for indicador in ("REGISTRADO", "GUARDADO", "EXITO", "EXITOSAMENTE")
+    )):
         raise ClienteOmitidoError(
-            "Fuvex indico que el DNI ya fue registrado o no esta disponible."
+            re.sub(
+                r"\s+",
+                " ",
+                mensaje or "Fuvex indico que el DNI ya fue registrado o no esta disponible.",
+            ).strip()
         )
-    return "REGISTRADO" in texto or "GUARDADO" in texto or "EXITO" in texto
+
+    if any(
+        indicador in respuesta
+        for indicador in ("REGISTRADO", "GUARDADO", "EXITO", "EXITOSAMENTE")
+    ):
+        if await _aceptar_confirmacion_exito(page):
+            print("[*] Confirmacion de registro aceptada; continuando con el siguiente.")
+        return True
+
+    detalle = re.sub(
+        r"\s+",
+        " ",
+        " | ".join([*dialogos, *avisos]) or texto,
+    ).strip()[:600]
+    if any(
+        indicador in respuesta
+        for indicador in ("ERROR", "DEBE ADJUNTAR", "OBLIGATORIO", "NO SE PUDO")
+    ):
+        raise RegistroRechazadoError(
+            f"Fuvex rechazo el registro de {dni}: {detalle or 'sin detalle visible'}"
+        )
+    raise RegistroSinConfirmarError(
+        f"Fuvex no confirmo el registro de {dni}; respuesta visible: "
+        f"{detalle or 'ninguna'}; URL: {page.url}"
+    )
