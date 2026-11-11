@@ -14,6 +14,7 @@ from src.db import actualizar_estado_dni, obtener_pendiente_por_dni, obtener_pen
 from src.scraper import (
     FILTER_LIST_URL,
     FILTER_URL,
+    REGISTRO_URL,
     ColaEsperaLlenaError,
     ClienteOmitidoError,
     FiltroSinConfirmarError,
@@ -414,7 +415,7 @@ async def proceso_registros(
                 pagina_registro = await abrir_pagina_con_sesion(
                     pagina_registro,
                     browser,
-                    "https://fuvexbn.a365.com.pe:7443/BN/Registro_Prospecto_BN.php",
+                    REGISTRO_URL,
                     "registro_prospecto_bn.php",
                     session_lock=session_lock,
                 )
@@ -459,6 +460,25 @@ async def proceso_registros(
                     print(
                         f"[!] El prospecto {dni} se registro en Fuvex, pero Supabase "
                         f"no se actualizo: {exc}"
+                    )
+                try:
+                    pagina_registro = await abrir_pagina_con_sesion(
+                        pagina_registro,
+                        browser,
+                        REGISTRO_URL,
+                        "registro_prospecto_bn.php",
+                        recargar=True,
+                        session_lock=session_lock,
+                    )
+                    print(
+                        "[*] Formulario de registro recargado para limpiar "
+                        "la confirmacion antes del siguiente prospecto."
+                    )
+                except Exception as exc:
+                    print(
+                        f"[!] Prospecto {dni} ya fue registrado, pero no pude "
+                        f"recargar el formulario: {exc}. Se intentara recuperar "
+                        "antes del siguiente registro."
                     )
             else:
                 print(f"[!] Fuvex no confirmo el registro de {dni}; se revisara de nuevo.")

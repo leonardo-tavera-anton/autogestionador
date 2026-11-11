@@ -99,14 +99,32 @@ async def _avisos_visibles(page):
 
 
 async def _aceptar_confirmacion_exito(page):
-    selectores_modal = ".swal2-popup:visible, [role='dialog']:visible, .modal:visible"
+    selectores_modal = (
+        ".swal-modal:visible, .swal2-popup:visible, "
+        "[role='dialog']:visible, .modal:visible"
+    )
     modal = page.locator(selectores_modal).last
     modal_visible = await modal.count() > 0
+    selector_botones_modal = (
+        ".swal-button--confirm:visible, .swal2-confirm:visible, "
+        "button:visible, [role='button']:visible, "
+        "input[type='button']:visible, a:visible"
+    )
     selector_botones = (
         "button:visible, [role='button']:visible, "
         "input[type='button']:visible, a:visible"
     )
-    botones = modal.locator(selector_botones) if modal_visible else page.locator(selector_botones)
+    if modal_visible:
+        botones_especiales = modal.locator(
+            ".swal-button--confirm:visible, .swal2-confirm:visible"
+        )
+        botones = (
+            botones_especiales
+            if await botones_especiales.count()
+            else modal.locator(selector_botones_modal)
+        )
+    else:
+        botones = page.locator(selector_botones)
     etiquetas = await botones.evaluate_all(
         "els => els.map(e => (e.innerText || e.value || "
         "e.getAttribute('aria-label') || '').trim())"
@@ -145,6 +163,15 @@ async def _aceptar_confirmacion_exito(page):
             raise RuntimeError(
                 "Se pulso OK/Aceptar, pero la confirmacion de Fuvex sigue visible."
             ) from exc
+        overlay = page.locator(".swal-overlay:visible").last
+        if await overlay.count():
+            try:
+                await overlay.wait_for(state="hidden", timeout=5000)
+            except PlaywrightError as exc:
+                raise RuntimeError(
+                    "Se cerro el mensaje, pero la capa de confirmacion "
+                    "sigue bloqueando el formulario."
+                ) from exc
     return True
 
 
