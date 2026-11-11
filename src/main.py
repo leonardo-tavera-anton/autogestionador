@@ -6,6 +6,7 @@ from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
+from src.heylocate_helper import consultar_operadora
 
 load_dotenv()
 
@@ -13,11 +14,13 @@ from src.db import actualizar_estado_dni, obtener_pendiente_por_dni, obtener_pen
 from src.scraper import (
     FILTER_LIST_URL,
     FILTER_URL,
+    ColaEsperaLlenaError,
+    ClienteOmitidoError,
     FiltroSinConfirmarError,
+    FiltrosNoDisponiblesError,
     abrir_pagina,
     dnis_con_filtro_correcto,
     filtrar_dni,
-    buscar_evidencia_cliente,
     registrar_prospecto,
 )
 
@@ -114,14 +117,15 @@ async def limpiar_pestanas_fuvex(browser, conservar=()):
                 pass
 
 
-async def abrir_pagina_con_sesion(page, browser, url, ruta_esperada):
+async def abrir_pagina_con_sesion(page, browser, url, ruta_esperada, recargar=False):
     """Abre una página de Fuvex y renueva el acceso si hubo redirección al login."""
     ruta = ruta_esperada.lower()
-    if ruta in page.url.lower():
+    if not recargar and ruta in page.url.lower():
         return page
-    for frame in getattr(page, "frames", []):
-        if ruta in frame.url.lower():
-            return frame
+    if not recargar:
+        for frame in getattr(page, "frames", []):
+            if ruta in frame.url.lower():
+                return frame
 
     await abrir_pagina(page, url)
     if ruta in page.url.lower():
@@ -166,6 +170,28 @@ async def abrir_pagina_con_sesion(page, browser, url, ruta_esperada):
             f"No se pudo abrir {url}. URL final: {page.url}; titulo: {await page.title()}"
         )
     return page
+
+
+async def enviar_filtro_con_espera(page, browser, dni):
+    """Reintenta el mismo DNI cada minuto si la cola de Fuvex esta llena."""
+    while True:
+        print(f"[*] Recargando el formulario antes del filtro para {dni}.")
+        page = await abrir_pagina_con_sesion(
+            page,
+            browser,
+            FILTER_URL,
+            "ingresar_filtro.php",
+            recargar=True,
+        )
+        try:
+            await filtrar_dni(page, dni)
+            return page
+        except ColaEsperaLlenaError as exc:
+            print(
+                f"[!] La cola de espera de Fuvex esta llena para {dni}: {exc}. "
+                "No se marcara como enviado; recargare y reintentare en 60 segundos."
+            )
+            await asyncio.sleep(60)
 
 
 async def abrir_modulo_desde_menu(page, browser, ruta_esperada, _reintento_google=False):
@@ -260,6 +286,106 @@ async def abrir_modulo_desde_menu(page, browser, ruta_esperada, _reintento_googl
     return None, list(dict.fromkeys(descripciones + errores))
 
 
+async def proceso_registros(
+    pagina_lista,
+    pagina_registro,
+    pagina_operadora,
+    browser,
+    intervalo_revision,
+    dnis_aprobados,
+    registro_inicializado,
+):
+    """Revisa aprobados y registra prospectos de forma independiente."""
+    dnis_verdes_atendidos = set()
+    while True:
+        try:
+            pagina_lista = await abrir_pagina_con_sesion(
+                pagina_lista, browser, FILTER_LIST_URL, "lista_filtros_f.php"
+            )
+            dnis_verdes = await dnis_con_filtro_correcto(pagina_lista)
+            dnis_aprobados.update(dnis_verdes)
+            registro_inicializado.set()
+            filas_verdes = []
+            for dni in dnis_verdes:
+                if dni in dnis_verdes_atendidos:
+                    continue
+                fila = await asyncio.to_thread(obtener_pendiente_por_dni, dni)
+                if fila:
+                    filas_verdes.append(fila)
+                if len(filas_verdes) == 2:
+                    break
+            print(
+                f"[*] Proceso de registro: {len(dnis_verdes)} filtros aprobados; "
+                f"{len(filas_verdes)} clientes pendientes."
+            )
+        except Exception as exc:
+            registro_inicializado.set()
+            print(f"[!] No pude revisar filtros aprobados: {exc}")
+            await asyncio.sleep(10)
+            continue
+
+        operadores_validos = {
+            "MOVISTAR": "Movistar",
+            "ENTEL": "Entel",
+            "CLARO": "Claro",
+            "BITEL": "Bitel",
+        }
+        for cliente in filas_verdes:
+            dni = str(cliente["dni"]).strip()
+            try:
+                operador_detectado = await consultar_operadora(
+                    pagina_operadora, cliente.get("celular", "")
+                )
+            except Exception as exc:
+                print(f"[!] No pude consultar la operadora del DNI {dni}: {exc}")
+                continue
+
+            operador = operadores_validos.get(operador_detectado)
+            if operador is None:
+                print(
+                    f"[!] HeyLocate no dio una operadora verificable para DNI {dni}; "
+                    "se volvera a intentar en el proximo ciclo."
+                )
+                continue
+
+            try:
+                pagina_registro = await abrir_pagina_con_sesion(
+                    pagina_registro,
+                    browser,
+                    "https://fuvexbn.a365.com.pe:7443/BN/Registro_Prospecto_BN.php",
+                    "registro_prospecto_bn.php",
+                )
+                registrado = await registrar_prospecto(
+                    pagina_registro,
+                    dni,
+                    cliente.get("nombre", ""),
+                    cliente.get("celular", ""),
+                    operador,
+                )
+            except ClienteOmitidoError as exc:
+                dnis_verdes_atendidos.add(dni)
+                print(f"[*] Se omite el DNI {dni} y se continua: {exc}")
+                continue
+            except Exception as exc:
+                print(f"[!] Fallo el registro del DNI {dni}: {exc}")
+                continue
+
+            if registrado:
+                dnis_verdes_atendidos.add(dni)
+                try:
+                    await asyncio.to_thread(actualizar_estado_dni, dni, "registrado")
+                    print(f"[*] Prospecto {dni} registrado y estado actualizado.")
+                except Exception as exc:
+                    print(
+                        f"[!] El prospecto {dni} se registro en Fuvex, pero Supabase "
+                        f"no se actualizo: {exc}"
+                    )
+            else:
+                print(f"[!] Fuvex no confirmo el registro de {dni}; se revisara de nuevo.")
+
+        await asyncio.sleep(intervalo_revision)
+
+
 async def main():
     brave_exe = encontrar_brave()
     if brave_exe is None:
@@ -274,6 +400,7 @@ async def main():
             executable_path=str(brave_exe),
             headless=False,
         )
+        proceso_registro = None
         try:
             paginas = list(browser.pages)
             pagina_inicio = next(
@@ -301,6 +428,7 @@ async def main():
             await limpiar_pestanas_fuvex(browser, conservar=(pagina_filtro,))
             pagina_lista = await browser.new_page()
             pagina_registro = await browser.new_page()
+            pagina_operadora = await browser.new_page()
             pagina_filtro = await abrir_pagina_con_sesion(
                 pagina_filtro, browser, FILTER_URL, "ingresar_filtro.php"
             )
@@ -315,117 +443,38 @@ async def main():
             )
             await limpiar_pestanas_fuvex(
                 browser,
-                conservar=(pagina_filtro, pagina_lista, pagina_registro),
+                conservar=(
+                    pagina_filtro,
+                    pagina_lista,
+                    pagina_registro,
+                    pagina_operadora,
+                ),
             )
-            print("[*] Fuvex abierto en tres pestanas: filtrar, revisar lista y registrar.")
+            print("[*] Fuvex abierto. Filtrado y registro usaran ciclos independientes.")
 
             dnis_enviados_en_esta_sesion = set()
-            dnis_verdes_atendidos = set()
-            dnis_sin_evidencia_reportados = set()
-            intervalo_revision = max(30, int(os.getenv("FUVEX_INTERVAL_SECONDS", "180")))
-            espera_resultado = max(300, int(os.getenv("FUVEX_RESULT_WAIT_SECONDS", "300")))
+            intervalo_revision = max(30, int(os.getenv("FUVEX_INTERVAL_SECONDS", "60")))
+            dnis_aprobados = set()
+            registro_inicializado = asyncio.Event()
+            proceso_registro = asyncio.create_task(
+                proceso_registros(
+                    pagina_lista,
+                    pagina_registro,
+                    pagina_operadora,
+                    browser,
+                    intervalo_revision,
+                    dnis_aprobados,
+                    registro_inicializado,
+                )
+            )
+            print("[*] Proceso de registro ejecutandose en paralelo al filtrado.")
+            await registro_inicializado.wait()
             while True:
                 try:
-                    pagina_lista = await abrir_pagina_con_sesion(
-                        pagina_lista, browser, FILTER_LIST_URL, "lista_filtros_f.php"
-                    )
-                    dnis_verdes = await dnis_con_filtro_correcto(pagina_lista)
-                    filas_verdes = []
-                    for dni_verde in dnis_verdes:
-                        if dni_verde in dnis_verdes_atendidos:
-                            continue
-                        fila = obtener_pendiente_por_dni(dni_verde)
-                        if fila:
-                            filas_verdes.append(fila)
-                        if len(filas_verdes) == 2:
-                            break
-                    print(
-                        f"[*] Resultados verdes en la lista: {len(dnis_verdes)}; "
-                        f"asociados a clientes pendientes: {len(filas_verdes)}."
-                    )
-                except Exception as exc:
-                    print(f"[!] No pude revisar filtros verdes existentes: {exc}")
-                    filas_verdes = []
-
-                if filas_verdes:
-                    for cliente in filas_verdes:
-                        cliente_dni = str(cliente["dni"]).strip()
-                        if buscar_evidencia_cliente(cliente_dni) is None:
-                            if cliente_dni not in dnis_sin_evidencia_reportados:
-                                print(
-                                    f"[!] DNI {cliente_dni}: falta su evidencia individual en "
-                                    "assets/documentos/{DNI}.pdf/.jpg/.jpeg/.png. "
-                                    "assets/documento_requerido.jpeg no corresponde a este cliente; "
-                                    "se omitira el registro."
-                                )
-                                dnis_sin_evidencia_reportados.add(cliente_dni)
-                            continue
-                        dnis_sin_evidencia_reportados.discard(cliente_dni)
-                        decision = await asyncio.to_thread(
-                            input,
-                            "Fuvex muestra VALIDACION CORRECTO para un filtro existente. "
-                            "Escribe REGISTRAR para continuar o S para omitir: ",
-                        )
-                        if decision.strip().upper() != "REGISTRAR":
-                            dnis_verdes_atendidos.add(cliente_dni)
-                            continue
-                        operadores_validos = {
-                            "MOVISTAR": "Movistar",
-                            "ENTEL": "Entel",
-                            "CLARO": "Claro",
-                            "BITEL": "Bitel",
-                        }
-                        while True:
-                            operador_ingresado = await asyncio.to_thread(
-                                input,
-                                "Operadora confirmada (Movistar/Entel/Claro/Bitel): ",
-                            )
-                            operador = operadores_validos.get(
-                                operador_ingresado.strip().upper()
-                            )
-                            if operador:
-                                break
-                            print("[!] Ingresa una de las operadoras mostradas en FUVEX.")
-                        try:
-                            pagina_registro = await abrir_pagina_con_sesion(
-                                pagina_registro,
-                                browser,
-                                "https://fuvexbn.a365.com.pe:7443/BN/Registro_Prospecto_BN.php",
-                                "registro_prospecto_bn.php",
-                            )
-                            registrado = await registrar_prospecto(
-                                pagina_registro,
-                                cliente_dni,
-                                cliente.get("nombre", ""),
-                                cliente.get("celular", ""),
-                                cliente.get("monto", ""),
-                                operador,
-                            )
-                        except Exception as exc:
-                            print(f"[!] Fallo el formulario para DNI {cliente_dni}: {exc}")
-                            continue
-
-                        if registrado:
-                            dnis_verdes_atendidos.add(cliente_dni)
-                            try:
-                                actualizar_estado_dni(cliente_dni, "registrado")
-                                print("[*] Prospecto registrado y estado actualizado en Supabase.")
-                            except Exception as exc:
-                                print(
-                                    f"[!] El prospecto {cliente_dni} se registro en Fuvex, "
-                                    f"pero no pude actualizar Supabase: {exc}"
-                                )
-                        else:
-                            print("[!] Fuvex no confirmo el registro; queda pendiente de revision.")
-                    await asyncio.sleep(intervalo_revision)
-                    pagina_lista = await abrir_pagina_con_sesion(
-                        pagina_lista, browser, FILTER_LIST_URL, "lista_filtros_f.php"
-                    )
-                    continue
-
-                try:
-                    clientes = obtener_pendientes(
-                        dnis_enviados_en_esta_sesion, cantidad=2
+                    clientes = await asyncio.to_thread(
+                        obtener_pendientes,
+                        dnis_enviados_en_esta_sesion | dnis_aprobados,
+                        cantidad=2,
                     )
                 except Exception as exc:
                     if "No encuentro una columna de monto" in str(exc):
@@ -435,53 +484,52 @@ async def main():
                     continue
 
                 if not clientes:
-                    print("[*] No hay filas validas pendientes. Revisare ambas pestanas en 3 minutos.")
-                    await asyncio.sleep(intervalo_revision)
-                    pagina_lista = await abrir_pagina_con_sesion(
-                        pagina_lista, browser, FILTER_LIST_URL, "lista_filtros_f.php"
-                    )
-                    pagina_filtro = await abrir_pagina_con_sesion(
-                        pagina_filtro, browser, FILTER_URL, "ingresar_filtro.php"
-                    )
+                    print("[*] Proceso de filtros: no hay pendientes; revisare en 60 segundos.")
+                    await asyncio.sleep(60)
                     continue
 
                 print(f"[*] Supabase entrego {len(clientes)} clientes pendientes validos.")
 
+                pausa_por_filtros_agotados = False
                 for cliente in clientes:
                     cliente_dni = str(cliente.get("dni", "")).strip()
                     try:
-                        pagina_filtro = await abrir_pagina_con_sesion(
-                            pagina_filtro, browser, FILTER_URL, "ingresar_filtro.php"
+                        pagina_filtro = await enviar_filtro_con_espera(
+                            pagina_filtro, browser, cliente_dni
                         )
+                    except ClienteOmitidoError as exc:
+                        dnis_enviados_en_esta_sesion.add(cliente_dni)
+                        print(
+                            f"[*] Se omite el DNI {cliente_dni} y se continua con el "
+                            f"siguiente, sin modificar Supabase: {exc}"
+                        )
+                        continue
+                    except FiltrosNoDisponiblesError as exc:
+                        pausa_por_filtros_agotados = True
+                        print(
+                            f"[!] Fuvex no acepta mas filtros por ahora. Se pausa "
+                            f"la tanda y se revisara de nuevo en el siguiente ciclo: {exc}"
+                        )
+                        break
+                    except ValueError as exc:
+                        dnis_enviados_en_esta_sesion.add(cliente_dni)
+                        print(f"[!] Se omitio un registro con DNI invalido: {exc}")
+                        continue
+                    except FiltroSinConfirmarError as exc:
+                        dnis_enviados_en_esta_sesion.add(cliente_dni)
+                        print(f"[!] Resultado de filtro incierto para {cliente_dni}: {exc}")
+                        continue
                     except Exception as exc:
                         print(
                             f"[!] No se abrio la pagina de filtro para {cliente_dni}; "
                             f"se reintentara en el siguiente ciclo: {exc}"
                         )
                         break
-
-                    try:
-                        await filtrar_dni(pagina_filtro, cliente_dni)
-                    except ValueError as exc:
-                        dnis_enviados_en_esta_sesion.add(cliente_dni)
-                        print(f"[!] Se omitio un registro con DNI invalido: {exc}")
-                        continue
-                    except FiltroSinConfirmarError as exc:
-                        # No reenviar este DNI en esta sesion: Fuvex pudo procesarlo,
-                        # aunque la confirmacion no haya llegado al navegador.
-                        dnis_enviados_en_esta_sesion.add(cliente_dni)
-                        print(f"[!] Resultado de filtro incierto para {cliente_dni}: {exc}")
-                        continue
-                    except Exception as exc:
-                        print(
-                            f"[!] No se completo el filtro de {cliente_dni}: {exc}. "
-                            "No se marcara como enviado; se reintentara en el siguiente ciclo."
-                        )
-                        break
-
                     dnis_enviados_en_esta_sesion.add(cliente_dni)
                     try:
-                        actualizar_estado_dni(cliente_dni, "filtrado")
+                        await asyncio.to_thread(
+                            actualizar_estado_dni, cliente_dni, "filtrado"
+                        )
                     except Exception as exc:
                         print(
                             f"[!] Fuvex recibio el filtro de {cliente_dni}, pero no pude "
@@ -489,19 +537,19 @@ async def main():
                         )
                     print("[*] Filtro enviado; el resultado queda en Lista_Filtros_F.")
 
-                print(
-                    f"[*] Tanda enviada. Revisare la lista en {intervalo_revision} "
-                    f"segundos; el siguiente lote espera {espera_resultado} segundos."
-                )
-                await asyncio.sleep(intervalo_revision)
-                await dnis_con_filtro_correcto(pagina_lista)
-                restante = espera_resultado - intervalo_revision
-                if restante > 0:
-                    await asyncio.sleep(restante)
-                pagina_lista = await abrir_pagina_con_sesion(
-                    pagina_lista, browser, FILTER_LIST_URL, "lista_filtros_f.php"
-                )
+                if pausa_por_filtros_agotados:
+                    print(
+                        "[*] Proceso de filtros: consultare Supabase de nuevo en "
+                        f"{intervalo_revision} segundos."
+                    )
+                    await asyncio.sleep(intervalo_revision)
+                    continue
+
+                await asyncio.sleep(1)
         finally:
+            if proceso_registro is not None:
+                proceso_registro.cancel()
+                await asyncio.gather(proceso_registro, return_exceptions=True)
             try:
                 await browser.close()
             except Exception:

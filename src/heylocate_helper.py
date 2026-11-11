@@ -1,8 +1,31 @@
 import asyncio
 import re
+import time
+import unicodedata
 from playwright.async_api import Page, Error as PlaywrightError
 
 URL_CONSULTA_OPERADORA = "https://heylocate.mobi/es/"
+OPERADORAS = ("CLARO", "MOVISTAR", "ENTEL", "BITEL")
+
+
+def extraer_operadora(texto: str) -> str:
+    """Devuelve una operadora solo cuando aparece junto a una etiqueta de resultado."""
+    texto = unicodedata.normalize("NFKD", str(texto or "").upper())
+    texto = "".join(
+        caracter for caracter in texto if not unicodedata.combining(caracter)
+    )
+    texto = re.sub(r"\s+", " ", texto)
+    patron = (
+        r"\b(?:OPERADORA|OPERADOR|CARRIER|NETWORK|RED|"
+        r"PROVEEDOR\s+DE\s+TELECOMUNICACIONES(?:\s*/\s*AREA)?)\b"
+        r"\s*(?::|-|ES)?\s*(?:MOVIL\s+)?"
+        r"\b(CLARO|MOVISTAR|ENTEL|BITEL)\b"
+    )
+    coincidencia = re.search(patron, texto)
+    if coincidencia:
+        return coincidencia.group(1)
+    return "DESCONOCIDA"
+
 
 async def consultar_operadora(page: Page, celular: str) -> str:
     celular_limpio = str(celular or "").strip()
@@ -11,30 +34,39 @@ async def consultar_operadora(page: Page, celular: str) -> str:
 
     try:
         await page.goto(URL_CONSULTA_OPERADORA, wait_until="domcontentloaded", timeout=45000)
-        input_selector = "input[type='text'], input[type='tel']"
-        await page.wait_for_selector(input_selector, timeout=10000)
+        campo_input = page.locator("input[type='tel']:visible").first
+        try:
+            await campo_input.wait_for(state="visible", timeout=10000)
+        except PlaywrightError:
+            campo_input = page.locator(
+                "input[type='text']:visible:not(.iti__search-input)"
+                ":not([aria-label='Search']):not([placeholder='Search'])"
+            ).first
+            await campo_input.wait_for(state="visible", timeout=10000)
 
-        campo_input = page.locator(input_selector).first
-        await campo_input.fill("")
-        await campo_input.type(celular_limpio, delay=40)
+        await campo_input.fill(celular_limpio)
 
-        btn_buscar = page.locator("button:has-text('BUSCAR'), button[type='submit'], input[type='submit']")
-        if await btn_buscar.count() > 0:
-            await btn_buscar.first.click()
+        boton_buscar = page.get_by_role(
+            "button", name=re.compile(r"^\s*BUSCAR\s*$", re.I)
+        ).first
+        if await boton_buscar.count() and await boton_buscar.is_visible():
+            await boton_buscar.click()
         else:
-            await campo_input.press("Enter")
+            boton_buscar = page.locator(
+                "button[type='submit']:visible, input[type='submit']:visible"
+            ).first
+            if await boton_buscar.count():
+                await boton_buscar.click()
+            else:
+                await campo_input.press("Enter")
 
-        await asyncio.sleep(7)
-        contenido_texto = await page.locator("body").inner_text()
-        texto_upper = contenido_texto.upper()
-
-        operadora_detectada = "DESCONOCIDA"
-        for op in ["CLARO", "MOVISTAR", "ENTEL", "BITEL"]:
-            if op in texto_upper:
-                operadora_detectada = op
-                break
-
-        return operadora_detectada
-
-    except (PlaywrightError, Exception):
+        plazo = time.monotonic() + 10
+        while time.monotonic() < plazo:
+            contenido_texto = await page.locator("body").inner_text()
+            operadora = extraer_operadora(contenido_texto)
+            if operadora in OPERADORAS:
+                return operadora
+            await asyncio.sleep(0.5)
         return "DESCONOCIDA"
+    except PlaywrightError as exc:
+        raise RuntimeError(f"No se pudo consultar la operadora en HeyLocate: {exc}") from exc

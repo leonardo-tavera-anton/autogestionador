@@ -13,6 +13,13 @@ if not supabase_url or not supabase_key:
 
 supabase = create_client(supabase_url, supabase_key)
 
+try:
+    MONTO_MINIMO = float(os.getenv("FUVEX_MIN_AMOUNT", "5000"))
+except ValueError as exc:
+    raise RuntimeError("FUVEX_MIN_AMOUNT debe ser un monto numerico.") from exc
+if MONTO_MINIMO < 0:
+    raise RuntimeError("FUVEX_MIN_AMOUNT no puede ser negativo.")
+
 
 def _monto_numerico(valor):
     try:
@@ -49,7 +56,7 @@ def obtener_pendientes(excluir_dnis=None, cantidad=2):
             consulta = (
                 supabase.table("clientes")
                 .select("dni,nombre,celular,monto,estado")
-                .gte("monto", 20000)
+                .gte("monto", MONTO_MINIMO)
                 .lte("monto", 99999)
                 .order("monto", desc=True)
                 .order("dni")
@@ -60,8 +67,11 @@ def obtener_pendientes(excluir_dnis=None, cantidad=2):
                 consulta = consulta.eq("estado", estado)
 
             respuesta = consulta.range(inicio, inicio + 99).execute()
-            pagina = respuesta.data or []
+            datos = respuesta.data
+            pagina = datos if isinstance(datos, list) else []
             for fila in pagina:
+                if not isinstance(fila, dict):
+                    continue
                 dni = str(fila.get("dni", "")).strip()
                 celular = _celular_peruano(fila.get("celular"))
                 nombre = str(fila.get("nombre", "")).strip()
@@ -97,7 +107,7 @@ def obtener_pendiente_por_dni(dni):
             supabase.table("clientes")
             .select("dni,nombre,celular,monto,estado")
             .eq("dni", str(dni).strip())
-            .gte("monto", 20000)
+            .gte("monto", MONTO_MINIMO)
             .lte("monto", 99999)
         )
         if estado is None:
@@ -105,8 +115,11 @@ def obtener_pendiente_por_dni(dni):
         else:
             consulta = consulta.eq("estado", estado)
         respuesta = consulta.limit(1).execute()
-        if respuesta.data:
-            fila = respuesta.data[0]
+        datos = respuesta.data
+        if isinstance(datos, list) and datos:
+            fila = datos[0]
+            if not isinstance(fila, dict):
+                continue
             nombre = str(fila.get("nombre", "")).strip().lower()
             celular = _celular_peruano(fila.get("celular"))
             if nombre not in {"", "none", "null"} and celular is not None:

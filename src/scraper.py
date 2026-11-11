@@ -1,5 +1,6 @@
 import re
 import unicodedata
+from datetime import date
 from pathlib import Path
 
 from playwright.async_api import Error as PlaywrightError
@@ -7,11 +8,43 @@ from playwright.async_api import Error as PlaywrightError
 FILTER_URL = "https://fuvexbn.a365.com.pe:7443/BN/ingresar_filtro.php"
 FILTER_LIST_URL = "https://fuvexbn.a365.com.pe:7443/BN/Lista_Filtros_F.php"
 REGISTRO_URL = "https://fuvexbn.a365.com.pe:7443/BN/Registro_Prospecto_BN.php"
-DOCUMENTOS_DIR = Path(__file__).resolve().parent.parent / "assets" / "documentos"
+EVIDENCIA_REQUERIDA = (
+    Path(__file__).resolve().parent.parent / "assets" / "documento_requerido.jpeg"
+)
 
 
 class FiltroSinConfirmarError(RuntimeError):
     """El clic se envio, pero Fuvex no mostro una confirmacion verificable."""
+
+
+class ClienteOmitidoError(RuntimeError):
+    """Fuvex indico que el cliente ya se proceso o no esta disponible."""
+
+
+class FiltrosNoDisponiblesError(RuntimeError):
+    """Fuvex no permite continuar porque no hay filtros disponibles."""
+
+
+class ColaEsperaLlenaError(RuntimeError):
+    """Fuvex rechaza el filtro porque la cola de espera alcanzo su limite."""
+
+
+_CLIENTE_OMITIDO_RE = re.compile(
+    r"\b(?:YA )?(?:SE ENCUENTRA|FUE|HA SIDO|SE HA|ESTA|SIGUE) "
+    r"(?:FILTRAD[OA]|REGISTRAD[OA]|PENDIENTE|EN ESPERA|EN PROCESO)\b"
+    r"|\bNO (?:ESTA|SE ENCUENTRA) DISPONIBLE\b"
+    r"|\b(?:SOLICITUD|FILTRO) (?:YA )?(?:ESTA|SE ENCUENTRA) "
+    r"(?:PENDIENTE|EN ESPERA|EN PROCESO)\b"
+)
+_SIN_FILTROS_RE = re.compile(
+    r"\b(?:NO HAY|NO TIENE|NO CUENTA CON|SIN|AGOT[OA]S?) "
+    r"(?:MAS )?(?:FILTROS?|SOLICITUDES?)\b"
+    r"|\bFILTROS? DISPONIBLES? (?:AGOTAD[OA]S?|INSUFICIENTES?)\b"
+)
+_COLA_ESPERA_LLENA_RE = re.compile(
+    r"\b(?:COMO )?MAXIMO\b.{0,80}\bCOLA DE ESPERA\b"
+    r"|\bCOLA DE ESPERA\b.{0,80}\bMAXIMO\b"
+)
 
 
 def _normalizar(texto):
@@ -19,16 +52,36 @@ def _normalizar(texto):
     return "".join(caracter for caracter in texto if not unicodedata.combining(caracter))
 
 
-def buscar_evidencia_cliente(dni):
-    """Busca solo una evidencia individual cuyo nombre corresponda al DNI."""
-    dni = str(dni or "").strip()
-    if not re.fullmatch(r"\d{8}", dni):
-        return None
-    for extension in (".pdf", ".jpg", ".jpeg", ".png"):
-        documento = DOCUMENTOS_DIR / f"{dni}{extension}"
-        if documento.is_file():
-            return documento
-    return None
+def _cliente_omitido(texto):
+    return bool(_CLIENTE_OMITIDO_RE.search(_normalizar(texto)))
+
+
+def _sin_filtros_disponibles(texto):
+    return bool(_SIN_FILTROS_RE.search(_normalizar(texto)))
+
+
+def _cola_espera_llena(texto):
+    normalizado = re.sub(r"\s+", " ", _normalizar(texto))
+    return bool(_COLA_ESPERA_LLENA_RE.search(normalizado))
+
+
+def fecha_estimada_visita(hoy=None):
+    hoy = hoy or date.today()
+    anio, mes = hoy.year, hoy.month
+    if hoy.day > 23:
+        mes += 1
+        if mes > 12:
+            mes = 1
+            anio += 1
+    return date(anio, mes, 23)
+
+
+async def _avisos_visibles(page):
+    avisos = page.locator(
+        ".alert:visible, [role='alert']:visible, .swal2-popup:visible, "
+        ".toast:visible, .modal:visible"
+    )
+    return await avisos.all_inner_texts()
 
 
 async def abrir_pagina(page, url):
@@ -79,6 +132,15 @@ async def _buscar_selector(page, patron):
             f"No encontre el selector ({patron}). Selectores disponibles: {detalle or 'ninguno'}"
         )
     return page.locator("select").nth(selector["index"])
+
+
+async def _selector_por_id(page, identificador):
+    selector = page.locator(f"#{identificador}")
+    if not await selector.count():
+        raise RuntimeError(
+            f"No encontre el campo requerido #{identificador} en el formulario."
+        )
+    return selector
 
 
 async def dnis_con_filtro_correcto(page):
@@ -189,23 +251,62 @@ async def filtrar_dni(page, dni):
     if accion is None:
         raise RuntimeError("No encontre el boton Buscar/Filtrar en Fuvex.")
 
+    avisos_anteriores = set(await _avisos_visibles(page))
     try:
         await page.locator(selector_botones).nth(accion["index"]).click()
     except PlaywrightError as exc:
         raise FiltroSinConfirmarError(
             f"No se pudo confirmar si Fuvex recibio el clic. URL: {page.url}"
         ) from exc
-    try:
-        await page.get_by_text(
-            re.compile(r"Se registr.{0,3} con .{0,3}xito", re.I)
-        ).first.wait_for(state="visible", timeout=20000)
-    except PlaywrightError as exc:
-        texto = _normalizar(await page.locator("body").inner_text())
+    confirmacion = page.get_by_text(
+        re.compile(r"Se registr.{0,3} con .{0,3}xito", re.I)
+    ).first
+    aviso_cola_llena = page.get_by_text(_COLA_ESPERA_LLENA_RE).first
+    for _ in range(80):
+        if await confirmacion.count() and await confirmacion.is_visible():
+            break
+        if await aviso_cola_llena.count() and await aviso_cola_llena.is_visible():
+            mensaje = re.sub(r"\s+", " ", await aviso_cola_llena.inner_text()).strip()
+            raise ColaEsperaLlenaError(mensaje)
+        avisos_nuevos = [
+            aviso for aviso in await _avisos_visibles(page)
+            if aviso not in avisos_anteriores
+        ]
+        mensaje = next((aviso for aviso in avisos_nuevos if _cliente_omitido(aviso)), None)
+        if mensaje:
+            raise ClienteOmitidoError(re.sub(r"\s+", " ", mensaje).strip())
+        mensaje = next(
+            (aviso for aviso in avisos_nuevos if _sin_filtros_disponibles(aviso)),
+            None,
+        )
+        if mensaje:
+            raise FiltrosNoDisponiblesError(re.sub(r"\s+", " ", mensaje).strip())
+        mensaje = next(
+            (aviso for aviso in avisos_nuevos if _cola_espera_llena(aviso)),
+            None,
+        )
+        if mensaje:
+            raise ColaEsperaLlenaError(re.sub(r"\s+", " ", mensaje).strip())
+        await page.wait_for_timeout(250)
+    else:
+        texto = await page.locator("body").inner_text()
+        if _cliente_omitido(texto):
+            raise ClienteOmitidoError(
+                "Fuvex indico que el DNI ya fue filtrado/registrado o no esta disponible."
+            )
+        if _sin_filtros_disponibles(texto):
+            raise FiltrosNoDisponiblesError(
+                "Fuvex indico que ya no hay filtros disponibles."
+            )
+        if _cola_espera_llena(texto):
+            raise ColaEsperaLlenaError(
+                "Fuvex indico que la cola de espera alcanzo su limite."
+            )
         detalle = re.sub(r"\s+", " ", texto)[:400]
         raise FiltroSinConfirmarError(
             f"Se pulso el boton, pero Fuvex no confirmo el filtro. "
             f"URL: {page.url}; respuesta: {detalle or 'sin mensaje visible'}"
-        ) from exc
+        )
 
     boton_ok = page.get_by_role("button", name="OK", exact=True).last
     if await boton_ok.count():
@@ -213,7 +314,7 @@ async def filtrar_dni(page, dni):
     return True
 
 
-async def preparar_registro(page, dni, nombre, celular, monto, operador):
+async def preparar_registro(page, dni, nombre, celular, operador):
     if "registro_prospecto_bn.php" not in page.url.lower():
         await abrir_pagina(page, REGISTRO_URL)
     if "registro_prospecto_bn.php" not in page.url.lower():
@@ -225,7 +326,6 @@ async def preparar_registro(page, dni, nombre, celular, monto, operador):
     campo_celular = await _buscar_campo(
         page, r"celular|tel.?fono|movil|phone|tel[12]_num"
     )
-    campo_monto = await _buscar_campo(page, r"monto|importe")
     selector_operador = await _buscar_selector(page, r"operadora|operador")
     await campo_dni.fill(str(dni).strip())
     await campo_nombre.fill(str(nombre or "").strip())
@@ -233,23 +333,57 @@ async def preparar_registro(page, dni, nombre, celular, monto, operador):
     if telefono.endswith(".0"):
         telefono = telefono[:-2]
     await campo_celular.fill(telefono)
-    await campo_monto.fill(str(monto))
     await selector_operador.select_option(label=operador)
 
-    documento = buscar_evidencia_cliente(dni)
-    if documento is None:
+    valores_fijos = {
+        "PRODUCTO": "PRÉSTAMO NUEVO",
+        "OFICINA": "ANCASH - NUEVO CHIMBOTE",
+        "ESTADO_REGISTRO": "INTERESADO",
+        "MONTO": "90000",
+        "PLAZO": "60",
+        "TASA": "9.99",
+        "CANAL": "PRESENCIAL",
+    }
+    for identificador, valor in valores_fijos.items():
+        await (await _selector_por_id(page, identificador)).select_option(value=valor)
+
+    interaccion = await _selector_por_id(page, "TITULO_M")
+    opciones_interaccion = await interaccion.locator("option").evaluate_all(
+        "els => els.map(e => ({value: e.value, text: (e.textContent || '').trim()}))"
+    )
+    opcion_pantallazo = next(
+        (
+            opcion
+            for opcion in opciones_interaccion
+            if "Pantallazo Llamada" in opcion["text"]
+        ),
+        None,
+    )
+    if opcion_pantallazo is None:
+        raise RuntimeError(
+            "El formulario no ofrece la interaccion 'Pantallazo Llamada'."
+        )
+    await interaccion.select_option(value=opcion_pantallazo["value"])
+
+    fecha_visita = await _selector_por_id(page, "FECHA_VISITA")
+    await fecha_visita.fill(fecha_estimada_visita().isoformat())
+
+    comentarios = await _selector_por_id(page, "COMENTARIOS")
+    if not (await comentarios.input_value()).strip():
+        await comentarios.fill("Ingreso automático")
+
+    if not EVIDENCIA_REQUERIDA.is_file():
         raise FileNotFoundError(
-            f"Falta la evidencia individual de este cliente en {DOCUMENTOS_DIR} "
-            f"(nombre base: {dni})."
+            f"No se encontro la evidencia requerida: {EVIDENCIA_REQUERIDA}"
         )
     campo_archivo = page.locator("input[type='file']").first
     if not await campo_archivo.count():
         raise RuntimeError("El formulario no muestra un campo para adjuntar evidencias.")
-    await campo_archivo.set_input_files(str(documento))
+    await campo_archivo.set_input_files(str(EVIDENCIA_REQUERIDA))
 
 
-async def registrar_prospecto(page, dni, nombre, celular, monto, operador):
-    await preparar_registro(page, dni, nombre, celular, monto, operador)
+async def registrar_prospecto(page, dni, nombre, celular, operador):
+    await preparar_registro(page, dni, nombre, celular, operador)
     selector = "button:visible, a:visible, input[type='submit']:visible"
     acciones = await page.locator(selector).evaluate_all(
         "els => els.map((e, i) => ({index: i, text: (e.innerText || e.value || e.getAttribute('aria-label') || '').trim()}))"
@@ -265,4 +399,14 @@ async def registrar_prospecto(page, dni, nombre, celular, monto, operador):
     await page.locator(selector).nth(accion["index"]).click()
     await page.wait_for_timeout(1500)
     texto = _normalizar(await page.locator("body").inner_text())
+    avisos = await _avisos_visibles(page)
+    mensaje = next((aviso for aviso in avisos if _cliente_omitido(aviso)), None)
+    if mensaje:
+        raise ClienteOmitidoError(re.sub(r"\s+", " ", mensaje).strip())
+    if _cliente_omitido(texto) and not any(
+        indicador in texto for indicador in ("REGISTRADO", "GUARDADO", "EXITO")
+    ):
+        raise ClienteOmitidoError(
+            "Fuvex indico que el DNI ya fue registrado o no esta disponible."
+        )
     return "REGISTRADO" in texto or "GUARDADO" in texto or "EXITO" in texto
