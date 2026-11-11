@@ -143,6 +143,23 @@ async def _selector_por_id(page, identificador):
     return selector
 
 
+async def _establecer_valor_por_id(page, identificador, valor):
+    campo = await _selector_por_id(page, identificador)
+    etiqueta = await campo.evaluate("(el) => el.tagName.toLowerCase()")
+    if etiqueta == "select":
+        opciones = await campo.locator("option").evaluate_all(
+            "els => els.map(e => e.value)"
+        )
+        if valor not in opciones:
+            raise RuntimeError(
+                f"El selector #{identificador} no ofrece el valor esperado: {valor}."
+            )
+        await campo.select_option(value=valor)
+    else:
+        await campo.fill(valor)
+    return campo
+
+
 async def dnis_con_filtro_correcto(page):
     """Lee los DNI que la tabla Filtros sin registro marca como validos."""
     if "lista_filtros_f.php" not in page.url.lower():
@@ -326,7 +343,7 @@ async def preparar_registro(page, dni, nombre, celular, operador):
     campo_celular = await _buscar_campo(
         page, r"celular|tel.?fono|movil|phone|tel[12]_num"
     )
-    selector_operador = await _buscar_selector(page, r"operadora|operador")
+    selector_operador = await _selector_por_id(page, "TEL1_OP")
     await campo_dni.fill(str(dni).strip())
     await campo_nombre.fill(str(nombre or "").strip())
     telefono = str(celular or "").strip()
@@ -345,7 +362,7 @@ async def preparar_registro(page, dni, nombre, celular, operador):
         "CANAL": "PRESENCIAL",
     }
     for identificador, valor in valores_fijos.items():
-        await (await _selector_por_id(page, identificador)).select_option(value=valor)
+        await _establecer_valor_por_id(page, identificador, valor)
 
     interaccion = await _selector_por_id(page, "TITULO_M")
     opciones_interaccion = await interaccion.locator("option").evaluate_all(
