@@ -16,7 +16,8 @@ def extraer_operadora(texto: str) -> str:
     )
     texto = re.sub(r"\s+", " ", texto)
     patron = (
-        r"\b(?:OPERADORA|OPERADOR|CARRIER|NETWORK|RED|"
+        r"\b(?:OPERADORA|OPERADOR\s+ASIGNADO\s+ORIGINALMENTE|OPERADOR|"
+        r"CARRIER|NETWORK|RED|"
         r"PROVEEDOR\s+DE\s+TELECOMUNICACIONES(?:\s*/\s*AREA)?)\b"
         r"\s*(?::|-|ES)?\s*(?:MOVIL\s+)?"
         r"\b(CLARO|MOVISTAR|ENTEL|BITEL)\b"
@@ -65,6 +66,20 @@ async def consultar_operadora(page: Page, celular: str) -> str:
             contenido_texto = await page.locator("body").inner_text()
             operadora = extraer_operadora(contenido_texto)
             if operadora in OPERADORAS:
+                texto_normalizado = unicodedata.normalize("NFKD", contenido_texto.upper())
+                texto_normalizado = "".join(
+                    caracter
+                    for caracter in texto_normalizado
+                    if not unicodedata.combining(caracter)
+                )
+                if re.search(
+                    r"\bOPERADOR\s+ASIGNADO\s+ORIGINALMENTE\b",
+                    texto_normalizado,
+                ):
+                    print(
+                        "[!] HeyLocate solo muestra el operador originalmente asignado; "
+                        "podria no ser el actual."
+                    )
                 return operadora
             await asyncio.sleep(0.5)
         return "DESCONOCIDA"
