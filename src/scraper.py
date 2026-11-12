@@ -396,6 +396,16 @@ async def filtrar_dni(page, dni, antes_de_enviar=None):
 
     if "ingresar_filtro.php" not in page.url.lower():
         await abrir_pagina(page, FILTER_URL)
+    host = (urlsplit(page.url).hostname or "").lower()
+    ruta = urlsplit(page.url).path.lower()
+    if (
+        host == "accounts.google.com"
+        or (host == "fuvexbn.a365.com.pe" and ruta.endswith("/index.php"))
+        or await page.locator("#USUARIO").is_visible()
+    ):
+        raise SesionFuvexExpiradaError(
+            f"Fuvex requiere iniciar sesion antes de filtrar el DNI {dni}."
+        )
     if "ingresar_filtro.php" not in page.url.lower():
         raise RuntimeError(
             f"Fuvex redirigio fuera de la pagina de filtros. URL final: {page.url}; "

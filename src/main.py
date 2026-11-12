@@ -105,6 +105,40 @@ async def pagina_pide_google(page):
         return False
 
 
+async def esperar_sesion_fuvex(browser, sesion_requerida):
+    """Pausa ambos ciclos hasta que el usuario complete el acceso autorizado."""
+    if not sesion_requerida.is_set():
+        return
+
+    print(
+        "[!] Automatizacion pausada: completa el inicio de sesion en Brave. "
+        "Los ciclos se reanudaran cuando Fuvex vuelva al menu."
+    )
+    while sesion_requerida.is_set():
+        try:
+            paginas = list(browser.pages)
+        except Exception as exc:
+            raise RuntimeError(
+                "Se cerro el contexto de Brave/Playwright; no es posible "
+                "reanudar la sesion. Reinicia el programa."
+            ) from exc
+        if not paginas:
+            raise RuntimeError(
+                "Se cerraron todas las pestañas de Brave/Playwright; no es posible "
+                "reanudar la sesion. Reinicia el programa."
+            )
+
+        for page in paginas:
+            try:
+                if MENU_PATTERN.search(page.url) and not await pagina_pide_google(page):
+                    sesion_requerida.clear()
+                    print("[*] Sesion Fuvex restablecida; se reanudan los ciclos.")
+                    return
+            except Exception:
+                continue
+        await asyncio.sleep(2)
+
+
 async def limpiar_pestanas_fuvex(browser, conservar=()):
     """Cierra pestañas antiguas de Fuvex/Google, sin tocar otras páginas del usuario."""
     conservar_ids = {
@@ -186,13 +220,23 @@ async def _abrir_pagina_con_sesion(page, browser, url, ruta_esperada, recargar=F
 
 
 async def abrir_pagina_con_sesion(
-    page, browser, url, ruta_esperada, recargar=False, session_lock=None
+    page,
+    browser,
+    url,
+    ruta_esperada,
+    recargar=False,
+    session_lock=None,
+    sesion_requerida=None,
 ):
+    if sesion_requerida is not None:
+        await esperar_sesion_fuvex(browser, sesion_requerida)
     if session_lock is None:
         return await _abrir_pagina_con_sesion(
             page, browser, url, ruta_esperada, recargar
         )
     async with session_lock:
+        if sesion_requerida is not None:
+            await esperar_sesion_fuvex(browser, sesion_requerida)
         return await _abrir_pagina_con_sesion(
             page, browser, url, ruta_esperada, recargar
         )
@@ -220,7 +264,12 @@ def crear_limitador_envios(intervalo_minimo, tipo_envio):
 
 
 async def enviar_filtro_con_espera(
-    page, browser, dni, session_lock=None, antes_de_enviar=None
+    page,
+    browser,
+    dni,
+    session_lock=None,
+    antes_de_enviar=None,
+    sesion_requerida=None,
 ):
     """Reintenta el mismo DNI cada minuto si la cola de Fuvex esta llena."""
     while True:
@@ -232,6 +281,7 @@ async def enviar_filtro_con_espera(
             "ingresar_filtro.php",
             recargar=True,
             session_lock=session_lock,
+            sesion_requerida=sesion_requerida,
         )
         try:
             await filtrar_dni(page, dni, antes_de_enviar)
@@ -353,10 +403,12 @@ async def proceso_registros(
     registro_inicializado,
     session_lock,
     antes_de_enviar,
+    sesion_requerida,
 ):
     """Revisa aprobados y registra prospectos de forma independiente."""
     dnis_verdes_atendidos = set()
     while True:
+        await esperar_sesion_fuvex(browser, sesion_requerida)
         try:
             pagina_lista = await abrir_pagina_con_sesion(
                 pagina_lista,
@@ -364,6 +416,7 @@ async def proceso_registros(
                 FILTER_LIST_URL,
                 "lista_filtros_f.php",
                 session_lock=session_lock,
+                sesion_requerida=sesion_requerida,
             )
             dnis_verdes = await dnis_con_filtro_correcto(pagina_lista)
             dnis_aprobados.update(dnis_verdes)
@@ -381,6 +434,12 @@ async def proceso_registros(
                 f"[*] Proceso de registro: {len(dnis_verdes)} filtros aprobados; "
                 f"{len(filas_verdes)} clientes pendientes."
             )
+        except SesionFuvexExpiradaError as exc:
+            sesion_requerida.set()
+            registro_inicializado.set()
+            print(f"[!] {exc}")
+            await esperar_sesion_fuvex(browser, sesion_requerida)
+            continue
         except Exception as exc:
             registro_inicializado.set()
             print(f"[!] No pude revisar filtros aprobados: {exc}")
@@ -418,6 +477,7 @@ async def proceso_registros(
                     REGISTRO_URL,
                     "registro_prospecto_bn.php",
                     session_lock=session_lock,
+                    sesion_requerida=sesion_requerida,
                 )
                 registrado = await registrar_prospecto(
                     pagina_registro,
@@ -435,10 +495,13 @@ async def proceso_registros(
                 print(f"[!] {exc}; se revisara de nuevo en el siguiente ciclo.")
                 continue
             except SesionFuvexExpiradaError as exc:
+                dnis_verdes_atendidos.add(dni)
+                sesion_requerida.set()
                 print(
-                    f"[!] {exc} Se pausara el registro; completa la autenticacion "
-                    "en Brave y se volvera a revisar en el siguiente ciclo."
+                    f"[!] {exc} El resultado puede ser incierto; verifica este DNI "
+                    "en Fuvex antes de volver a procesarlo."
                 )
+                await esperar_sesion_fuvex(browser, sesion_requerida)
                 break
             except RegistroSinConfirmarError as exc:
                 dnis_verdes_atendidos.add(dni)
@@ -469,6 +532,7 @@ async def proceso_registros(
                         "registro_prospecto_bn.php",
                         recargar=True,
                         session_lock=session_lock,
+                        sesion_requerida=sesion_requerida,
                     )
                     print(
                         "[*] Formulario de registro recargado para limpiar "
@@ -556,6 +620,7 @@ async def main():
             intervalo_revision = max(30, int(os.getenv("FUVEX_INTERVAL_SECONDS", "60")))
             dnis_aprobados = set()
             registro_inicializado = asyncio.Event()
+            sesion_requerida = asyncio.Event()
             session_lock = asyncio.Lock()
             intervalo_entre_filtros = max(
                 10.0, float(os.getenv("FUVEX_FILTER_DELAY_SECONDS", "15"))
@@ -580,12 +645,14 @@ async def main():
                     registro_inicializado,
                     session_lock,
                     esperar_registro,
+                    sesion_requerida,
                 )
             )
             print("[*] Proceso de registro ejecutandose en paralelo al filtrado.")
             await registro_inicializado.wait()
             fallos_navegacion = 0
             while True:
+                await esperar_sesion_fuvex(browser, sesion_requerida)
                 try:
                     clientes = await asyncio.to_thread(
                         obtener_pendientes,
@@ -608,6 +675,7 @@ async def main():
 
                 pausa_por_filtros_agotados = False
                 for cliente in clientes:
+                    await esperar_sesion_fuvex(browser, sesion_requerida)
                     cliente_dni = str(cliente.get("dni", "")).strip()
                     try:
                         pagina_filtro = await enviar_filtro_con_espera(
@@ -616,6 +684,7 @@ async def main():
                             cliente_dni,
                             session_lock,
                             esperar_filtro,
+                            sesion_requerida,
                         )
                         fallos_navegacion = 0
                     except ClienteOmitidoError as exc:
@@ -633,6 +702,12 @@ async def main():
                             f"[!] Fuvex no acepta mas filtros por ahora. Se pausa "
                             f"la tanda y se revisara de nuevo en el siguiente ciclo: {exc}"
                         )
+                        break
+                    except SesionFuvexExpiradaError as exc:
+                        fallos_navegacion = 0
+                        sesion_requerida.set()
+                        print(f"[!] {exc}")
+                        await esperar_sesion_fuvex(browser, sesion_requerida)
                         break
                     except ValueError as exc:
                         fallos_navegacion = 0
