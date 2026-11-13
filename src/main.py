@@ -1,5 +1,6 @@
 import asyncio
 import os
+import random
 import re
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -348,7 +349,12 @@ def crear_limitador_envios(intervalo_minimo, tipo_envio):
             loop = asyncio.get_running_loop()
             ultimo_envio = estado["ultimo_envio"]
             if ultimo_envio is not None:
-                espera = intervalo_minimo - (loop.time() - ultimo_envio)
+                intervalo = (
+                    random.uniform(*intervalo_minimo)
+                    if isinstance(intervalo_minimo, tuple)
+                    else intervalo_minimo
+                )
+                espera = intervalo - (loop.time() - ultimo_envio)
                 if espera > 0:
                     print(
                         f"[*] Pausa de {espera:.0f} segundos antes del {tipo_envio}."
@@ -762,9 +768,18 @@ async def main():
             registro_inicializado = asyncio.Event()
             sesion_requerida = asyncio.Event()
             session_lock = asyncio.Lock()
-            intervalo_entre_filtros = max(
-                10.0, float(os.getenv("FUVEX_FILTER_DELAY_SECONDS", "15"))
+            intervalo_entre_filtros = (
+                float(os.getenv("FUVEX_FILTER_DELAY_MIN_SECONDS", "5")),
+                float(os.getenv("FUVEX_FILTER_DELAY_MAX_SECONDS", "10")),
             )
+            if (
+                intervalo_entre_filtros[0] < 0
+                or intervalo_entre_filtros[1] < intervalo_entre_filtros[0]
+            ):
+                raise ValueError(
+                    "FUVEX_FILTER_DELAY_MAX_SECONDS debe ser mayor o igual "
+                    "a FUVEX_FILTER_DELAY_MIN_SECONDS, ambos no negativos."
+                )
             intervalo_entre_registros = max(
                 60.0, float(os.getenv("FUVEX_REGISTRATION_DELAY_SECONDS", "60"))
             )

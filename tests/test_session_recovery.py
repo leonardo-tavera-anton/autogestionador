@@ -54,6 +54,25 @@ class FakeBrowser:
 
 
 class SessionRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_filter_limiter_uses_random_delay_range_between_sends(self):
+        sleeps = []
+
+        async def record_sleep(delay):
+            sleeps.append(delay)
+
+        limiter = main.crear_limitador_envios((5.0, 10.0), "filtro")
+        with (
+            patch.object(main.random, "uniform", return_value=7.5) as choose_interval,
+            patch.object(main.asyncio, "sleep", record_sleep),
+        ):
+            await limiter()
+            await limiter()
+
+        choose_interval.assert_called_once_with(5.0, 10.0)
+        self.assertEqual(len(sleeps), 1)
+        self.assertGreater(sleeps[0], 0)
+        self.assertLessEqual(sleeps[0], 7.5)
+
     async def test_old_module_tab_does_not_resume_expired_session(self):
         page = FakePage(main.FILTER_URL)
         browser = FakeBrowser([page])
