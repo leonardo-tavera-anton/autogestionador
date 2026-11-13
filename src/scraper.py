@@ -1,4 +1,5 @@
 import re
+import time
 import unicodedata
 from datetime import date
 from decimal import Decimal, InvalidOperation
@@ -37,6 +38,14 @@ class RegistroSinConfirmarError(RuntimeError):
 
 class RegistroRechazadoError(RuntimeError):
     """Fuvex rechazo el registro y mostro un mensaje de error."""
+
+
+class RegistroBloqueadoPorDialogoError(RuntimeError):
+    """Un diálogo anterior de Fuvex impide iniciar un nuevo registro."""
+
+
+class ConfirmacionExitoAnteriorError(RuntimeError):
+    """Se encontró y cerró una confirmación que no se puede atribuir a este DNI."""
 
 
 class SesionFuvexExpiradaError(RuntimeError):
@@ -92,10 +101,53 @@ def fecha_estimada_visita(hoy=None):
 
 async def _avisos_visibles(page):
     avisos = page.locator(
-        ".alert:visible, [role='alert']:visible, .swal2-popup:visible, "
-        ".toast:visible, .modal:visible"
+        ".alert:visible, [role='alert']:visible, .swal-modal:visible, "
+        ".swal2-popup:visible, .toast:visible, .modal:visible, "
+        ".invalid-feedback:visible, .text-danger:visible, "
+        ".error-message:visible"
     )
     return await avisos.all_inner_texts()
+
+
+async def _dialogo_fuvex_activo(page):
+    dialogo = page.locator(
+        ".swal-overlay:visible, .swal2-container:visible, "
+        ".swal-modal:visible, .swal2-popup:visible, "
+        "[role='dialog']:visible, .modal:visible"
+    ).first
+    if not await dialogo.count():
+        return None
+    return re.sub(r"\s+", " ", await dialogo.inner_text()).strip()
+
+
+def _es_confirmacion_exito(texto):
+    normalizado = _normalizar(texto)
+    return bool(
+        re.search(
+            r"\b(?:SE )?REGISTRO CON EXITO\b|\bREGISTRAD[OA] CON EXITO\b",
+            normalizado,
+        )
+    )
+
+
+async def esperar_cierre_dialogo_fuvex(page):
+    """Espera a que el usuario resuelva un diálogo previo en Fuvex."""
+    selector = (
+        ".swal-overlay:visible, .swal2-container:visible, "
+        ".swal-modal:visible, .swal2-popup:visible, "
+        "[role='dialog']:visible, .modal:visible"
+    )
+    dialogo = page.locator(selector)
+    if not await dialogo.count():
+        return False
+    print(
+        "[!] Hay un diálogo de Fuvex pendiente. Resuélvelo en Brave; "
+        "el proceso esperará para evitar enviar datos detrás del cuadro."
+    )
+    while await dialogo.count():
+        await page.wait_for_timeout(250)
+    print("[*] El diálogo de Fuvex se cerró.")
+    return True
 
 
 async def _aceptar_confirmacion_exito(page):
@@ -562,6 +614,23 @@ async def preparar_registro(page, dni, nombre, celular, operador):
 async def registrar_prospecto(
     page, dni, nombre, celular, operador, antes_de_enviar=None
 ):
+    dialogo_anterior = await _dialogo_fuvex_activo(page)
+    if dialogo_anterior:
+        if _es_confirmacion_exito(dialogo_anterior):
+            if not await _aceptar_confirmacion_exito(page):
+                raise RuntimeError(
+                    "Fuvex mostró una confirmación de éxito previa, pero no "
+                    "pude encontrar su botón OK."
+                )
+            raise ConfirmacionExitoAnteriorError(
+                "Se cerró una confirmación de registro exitosa que ya estaba "
+                "abierta. No se puede determinar a qué DNI corresponde."
+            )
+        raise RegistroBloqueadoPorDialogoError(
+            "Hay un diálogo previo de Fuvex que bloquea el formulario "
+            f"({dialogo_anterior[:300]}). No se enviará el DNI {dni}."
+        )
+
     await preparar_registro(page, dni, nombre, celular, operador)
     selector = "button:visible, a:visible, input[type='submit']:visible"
     acciones = await page.locator(selector).evaluate_all(
@@ -595,8 +664,46 @@ async def registrar_prospecto(
 
     page.on("dialog", aceptar_dialogo)
     try:
-        await page.locator(selector).nth(accion["index"]).click()
-        await page.wait_for_timeout(1500)
+        try:
+            await page.locator(selector).nth(accion["index"]).click(timeout=10000)
+        except PlaywrightError as exc:
+            dialogo = await _dialogo_fuvex_activo(page)
+            if dialogo:
+                raise RegistroBloqueadoPorDialogoError(
+                    "Un diálogo de Fuvex interceptó el botón Registrar "
+                    f"({dialogo[:300]}). No se pudo enviar el DNI {dni}."
+                ) from exc
+            raise
+
+        plazo_respuesta = time.monotonic() + 8
+        while time.monotonic() < plazo_respuesta:
+            host = (urlsplit(page.url).hostname or "").lower()
+            ruta = urlsplit(page.url).path.lower()
+            if (
+                host == "accounts.google.com"
+                or (host == "fuvexbn.a365.com.pe" and ruta.endswith("/index.php"))
+            ):
+                break
+            avisos = await _avisos_visibles(page)
+            texto = _normalizar(await page.locator("body").inner_text())
+            respuesta = _normalizar(" ".join([*dialogos, *avisos, texto]))
+            if (
+                any(
+                    indicador in respuesta
+                    for indicador in (
+                        "REGISTRADO",
+                        "GUARDADO",
+                        "EXITO",
+                        "EXITOSAMENTE",
+                        "ERROR",
+                        "OBLIGATORIO",
+                        "NO SE PUDO",
+                    )
+                )
+                or _cliente_omitido(respuesta)
+            ):
+                break
+            await page.wait_for_timeout(250)
     finally:
         page.remove_listener("dialog", aceptar_dialogo)
 
@@ -640,11 +747,10 @@ async def registrar_prospecto(
             print("[*] Confirmacion de registro aceptada; continuando con el siguiente.")
         return True
 
-    detalle = re.sub(
-        r"\s+",
-        " ",
-        " | ".join([*dialogos, *avisos]) or texto,
-    ).strip()[:600]
+    detalle = re.sub(r"\s+", " ", " | ".join([*dialogos, *avisos])).strip()
+    if not detalle:
+        detalle = "No aparecio un mensaje de resultado; la pagina sigue en el formulario."
+    detalle = detalle[:600]
     if any(
         indicador in respuesta
         for indicador in ("ERROR", "DEBE ADJUNTAR", "OBLIGATORIO", "NO SE PUDO")

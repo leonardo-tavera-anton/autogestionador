@@ -17,13 +17,16 @@ from src.scraper import (
     REGISTRO_URL,
     ColaEsperaLlenaError,
     ClienteOmitidoError,
+    ConfirmacionExitoAnteriorError,
     FiltroSinConfirmarError,
     FiltrosNoDisponiblesError,
+    RegistroBloqueadoPorDialogoError,
     RegistroRechazadoError,
     RegistroSinConfirmarError,
     SesionFuvexExpiradaError,
     abrir_pagina,
     dnis_con_filtro_correcto,
+    esperar_cierre_dialogo_fuvex,
     filtrar_dni,
     registrar_prospecto,
 )
@@ -36,6 +39,10 @@ BRAVE_USER_DATA = Path(
 )
 
 
+class ContextoNavegadorCerradoError(RuntimeError):
+    """El navegador cerró su contexto y no puede recuperar la sesión."""
+
+
 def encontrar_brave():
     configurado = os.getenv("BRAVE_PATH")
     posibles_rutas = [
@@ -45,6 +52,19 @@ def encontrar_brave():
         Path(r"C:\Program Files (x86)\BraveSoftware\Brave-Browser\Application\brave.exe"),
     ]
     return next((ruta for ruta in posibles_rutas if ruta and ruta.is_file()), None)
+
+
+def intervalo_aviso_google():
+    valor = os.getenv(
+        "GOOGLE_LOGIN_REMINDER_SECONDS",
+        os.getenv("GOOGLE_LOGIN_TIMEOUT_SECONDS", "600"),
+    )
+    try:
+        return max(60, int(valor))
+    except ValueError as exc:
+        raise RuntimeError(
+            "GOOGLE_LOGIN_REMINDER_SECONDS debe ser un numero entero."
+        ) from exc
 
 
 async def iniciar_sesion(page, browser):
@@ -74,13 +94,28 @@ async def iniciar_sesion(page, browser):
         ) from exc
 
     await boton_google.click()
-    espera_google = max(60, int(os.getenv("GOOGLE_LOGIN_TIMEOUT_SECONDS", "600")))
+    intervalo_aviso = intervalo_aviso_google()
     print("[*] Google espera que elijas la cuenta autorizada en Brave y completes cualquier verificacion.")
 
-    # Google puede abrir otra pestaña o completar el acceso en la misma.
-    for _ in range(espera_google):
-        for candidate in browser.pages:
-            if MENU_PATTERN.search(candidate.url) and not await pagina_pide_google(candidate):
+    siguiente_aviso = asyncio.get_running_loop().time() + intervalo_aviso
+    while True:
+        try:
+            paginas = list(browser.pages)
+        except Exception as exc:
+            raise ContextoNavegadorCerradoError(
+                "Se cerro Brave durante la autenticacion de Google. "
+                "Comprueba el navegador y vuelve a iniciar el programa."
+            ) from exc
+        if not paginas:
+            raise ContextoNavegadorCerradoError(
+                "Se cerraron todas las pestañas durante la autenticacion de Google. "
+                "Abre Brave y vuelve a iniciar el programa."
+            )
+
+        for candidate in paginas:
+            try:
+                if not MENU_PATTERN.search(candidate.url) or await pagina_pide_google(candidate):
+                    continue
                 try:
                     await candidate.wait_for_load_state("domcontentloaded", timeout=30000)
                 except Exception:
@@ -88,10 +123,18 @@ async def iniciar_sesion(page, browser):
                     pass
                 await candidate.wait_for_timeout(750)
                 return candidate
-        await asyncio.sleep(1)
+            except Exception:
+                continue
 
-    urls = ", ".join(candidate.url for candidate in browser.pages)
-    raise TimeoutError(f"No se completo el acceso a Fuvex en {espera_google} s. Pestanas abiertas: {urls}")
+        ahora = asyncio.get_running_loop().time()
+        if ahora >= siguiente_aviso:
+            urls = ", ".join(candidate.url for candidate in paginas) or "ninguna pestaña abierta"
+            print(
+                "[!] El acceso de Google sigue pendiente. Completa la selección de cuenta "
+                f"y cualquier verificación en Brave. Pestañas: {urls}"
+            )
+            siguiente_aviso = ahora + intervalo_aviso
+        await asyncio.sleep(1)
 
 
 async def pagina_pide_google(page):
@@ -105,37 +148,110 @@ async def pagina_pide_google(page):
         return False
 
 
-async def esperar_sesion_fuvex(browser, sesion_requerida):
+async def pagina_sesion_fuvex_activa(page):
+    """Reconoce el menú o un módulo Fuvex cargado tras la autenticación."""
+    direccion = urlsplit(page.url)
+    if (direccion.hostname or "").lower() != "fuvexbn.a365.com.pe":
+        return False
+    ruta = direccion.path.lower()
+    if await pagina_pide_google(page):
+        return False
+    if not MENU_PATTERN.search(page.url) and not (
+        ruta.startswith("/bn/") and ruta.endswith(".php")
+    ):
+        return False
+
+    campo_login = page.locator("#USUARIO")
+    try:
+        return not (await campo_login.count() and await campo_login.is_visible())
+    except Exception:
+        return False
+
+
+async def pagina_inicio_sesion_fuvex(page):
+    host = (urlsplit(page.url).hostname or "").lower()
+    ruta = urlsplit(page.url).path.lower()
+    if host == "accounts.google.com":
+        return True
+    if host != "fuvexbn.a365.com.pe":
+        return False
+    if ruta.endswith("/index.php") or await pagina_pide_google(page):
+        return True
+    campo_login = page.locator("#USUARIO")
+    try:
+        return await campo_login.count() > 0 and await campo_login.is_visible()
+    except Exception:
+        return False
+
+
+async def esperar_sesion_fuvex(browser, sesion_requerida, session_lock=None):
     """Pausa ambos ciclos hasta que el usuario complete el acceso autorizado."""
     if not sesion_requerida.is_set():
         return
 
     print(
-        "[!] Automatizacion pausada: completa el inicio de sesion en Brave. "
-        "Los ciclos se reanudaran cuando Fuvex vuelva al menu."
+        "[!] Sesión pausada. Completa el acceso a Fuvex en Brave."
     )
+    siguiente_aviso = asyncio.get_running_loop().time() + intervalo_aviso_google()
     while sesion_requerida.is_set():
         try:
             paginas = list(browser.pages)
         except Exception as exc:
-            raise RuntimeError(
+            raise ContextoNavegadorCerradoError(
                 "Se cerro el contexto de Brave/Playwright; no es posible "
                 "reanudar la sesion. Reinicia el programa."
             ) from exc
         if not paginas:
-            raise RuntimeError(
-                "Se cerraron todas las pestañas de Brave/Playwright; no es posible "
-                "reanudar la sesion. Reinicia el programa."
-            )
+            try:
+                if session_lock is None:
+                    pagina_acceso = await browser.new_page()
+                    await pagina_acceso.goto(
+                        FILTER_URL, wait_until="domcontentloaded", timeout=45000
+                    )
+                else:
+                    async with session_lock:
+                        if not browser.pages:
+                            pagina_acceso = await browser.new_page()
+                            await pagina_acceso.goto(
+                                FILTER_URL,
+                                wait_until="domcontentloaded",
+                                timeout=45000,
+                            )
+                print("[!] Se abrió una pestaña de acceso a Fuvex en Brave.")
+            except Exception as exc:
+                raise ContextoNavegadorCerradoError(
+                    "No pude abrir una pestaña para recuperar Fuvex. "
+                    "Comprueba que Brave siga abierto y reinicia el programa."
+                ) from exc
+            continue
 
         for page in paginas:
             try:
-                if MENU_PATTERN.search(page.url) and not await pagina_pide_google(page):
+                if not await pagina_sesion_fuvex_activa(page):
+                    continue
+                if session_lock is None:
+                    await page.goto(
+                        FILTER_URL, wait_until="domcontentloaded", timeout=45000
+                    )
+                else:
+                    async with session_lock:
+                        if page.is_closed() or not await pagina_sesion_fuvex_activa(page):
+                            continue
+                        await page.goto(
+                            FILTER_URL,
+                            wait_until="domcontentloaded",
+                            timeout=45000,
+                        )
+                if await pagina_sesion_fuvex_activa(page):
                     sesion_requerida.clear()
-                    print("[*] Sesion Fuvex restablecida; se reanudan los ciclos.")
+                    print("[*] Sesión verificada. Se reanudan los ciclos.")
                     return
             except Exception:
                 continue
+        ahora = asyncio.get_running_loop().time()
+        if ahora >= siguiente_aviso:
+            print("[!] Fuvex aún requiere acceso. Completa Google/verificación en Brave.")
+            siguiente_aviso = ahora + intervalo_aviso_google()
         await asyncio.sleep(2)
 
 
@@ -156,14 +272,14 @@ async def limpiar_pestanas_fuvex(browser, conservar=()):
 
 
 async def _abrir_pagina_con_sesion(page, browser, url, ruta_esperada, recargar=False):
-    """Abre una página de Fuvex y renueva el acceso si hubo redirección al login."""
+    """Abre un módulo y señala al coordinador si Fuvex requiere autenticación."""
     if page.is_closed():
         try:
             page = await browser.new_page()
         except Exception as exc:
-            raise RuntimeError(
+            raise ContextoNavegadorCerradoError(
                 "La pestaña se cerro y no se pudo abrir otra. "
-                "Comprueba si Brave sigue abierto."
+                "Comprueba que Brave siga abierto."
             ) from exc
 
     ruta = ruta_esperada.lower()
@@ -181,9 +297,12 @@ async def _abrir_pagina_con_sesion(page, browser, url, ruta_esperada, recargar=F
         if ruta in frame.url.lower():
             return frame
 
+    if await pagina_inicio_sesion_fuvex(page):
+        raise SesionFuvexExpiradaError(
+            f"Fuvex requiere volver a iniciar sesión antes de abrir {ruta_esperada}."
+        )
+
     if MENU_PATTERN.search(page.url):
-        if await pagina_pide_google(page):
-            page = await iniciar_sesion(page, browser)
         modulo, enlaces = await abrir_modulo_desde_menu(page, browser, ruta_esperada)
         if modulo:
             return modulo
@@ -193,30 +312,9 @@ async def _abrir_pagina_con_sesion(page, browser, url, ruta_esperada, recargar=F
             f"URL: {page.url}. Enlaces visibles: {detalle}"
         )
 
-    print(f"[!] Fuvex redirigio a {page.url}; intentando recuperar la sesion.")
-    page = await iniciar_sesion(page, browser)
-    await abrir_pagina(page, url)
-    if ruta not in page.url.lower():
-        for frame in getattr(page, "frames", []):
-            if ruta in frame.url.lower():
-                return frame
-        if MENU_PATTERN.search(page.url):
-            if await pagina_pide_google(page):
-                page = await iniciar_sesion(page, browser)
-            modulo, enlaces = await abrir_modulo_desde_menu(
-                page, browser, ruta_esperada
-            )
-            if modulo:
-                return modulo
-            detalle = " | ".join(enlaces) or "el menú no expone enlaces"
-            raise RuntimeError(
-                f"La sesión llegó al menú, pero no se encontró el módulo "
-                f"{ruta_esperada}. Enlaces visibles: {detalle}"
-            )
-        raise RuntimeError(
-            f"No se pudo abrir {url}. URL final: {page.url}; titulo: {await page.title()}"
-        )
-    return page
+    raise RuntimeError(
+        f"No se abrió {ruta_esperada}; Fuvex quedó en {page.url}."
+    )
 
 
 async def abrir_pagina_con_sesion(
@@ -229,14 +327,12 @@ async def abrir_pagina_con_sesion(
     sesion_requerida=None,
 ):
     if sesion_requerida is not None:
-        await esperar_sesion_fuvex(browser, sesion_requerida)
+        await esperar_sesion_fuvex(browser, sesion_requerida, session_lock)
     if session_lock is None:
         return await _abrir_pagina_con_sesion(
             page, browser, url, ruta_esperada, recargar
         )
     async with session_lock:
-        if sesion_requerida is not None:
-            await esperar_sesion_fuvex(browser, sesion_requerida)
         return await _abrir_pagina_con_sesion(
             page, browser, url, ruta_esperada, recargar
         )
@@ -356,7 +452,7 @@ async def abrir_modulo_desde_menu(page, browser, ruta_esperada, _reintento_googl
             vio_google = False
             timeout = 30
             inicio_espera = asyncio.get_running_loop().time()
-            while asyncio.get_running_loop().time() - inicio_espera < timeout:
+            while True:
                 for candidate in list(browser.pages):
                     if ruta in candidate.url.lower():
                         return candidate, list(dict.fromkeys(descripciones))
@@ -367,7 +463,8 @@ async def abrir_modulo_desde_menu(page, browser, ruta_esperada, _reintento_googl
                         if not vio_google:
                             print("[*] Google solicita confirmar la cuenta en Brave; esperando el retorno a Fuvex.")
                             vio_google = True
-                            timeout = max(60, int(os.getenv("GOOGLE_LOGIN_TIMEOUT_SECONDS", "600")))
+                            timeout = intervalo_aviso_google()
+                            inicio_espera = asyncio.get_running_loop().time()
                 for candidate in browser.pages:
                     if candidate not in antes and ruta in candidate.url.lower():
                         return candidate, list(dict.fromkeys(descripciones))
@@ -384,6 +481,16 @@ async def abrir_modulo_desde_menu(page, browser, ruta_esperada, _reintento_googl
                         return await abrir_modulo_desde_menu(
                             menu, browser, ruta_esperada, _reintento_google=True
                         )
+                transcurrido = asyncio.get_running_loop().time() - inicio_espera
+                if transcurrido >= timeout:
+                    if not vio_google:
+                        break
+                    urls = ", ".join(candidate.url for candidate in browser.pages)
+                    print(
+                        "[!] Google todavía no devolvió el acceso a Fuvex. "
+                        f"Completa la autenticación en Brave. Pestañas: {urls}"
+                    )
+                    inicio_espera = asyncio.get_running_loop().time()
                 await asyncio.sleep(0.5)
             urls = ', '.join(candidate.url for candidate in browser.pages)
             errores.append(f"el enlace se pulso, pero no aparecio {ruta_esperada}; pestanas: {urls}")
@@ -408,8 +515,8 @@ async def proceso_registros(
     """Revisa aprobados y registra prospectos de forma independiente."""
     dnis_verdes_atendidos = set()
     while True:
-        await esperar_sesion_fuvex(browser, sesion_requerida)
         try:
+            await esperar_sesion_fuvex(browser, sesion_requerida, session_lock)
             pagina_lista = await abrir_pagina_con_sesion(
                 pagina_lista,
                 browser,
@@ -438,8 +545,11 @@ async def proceso_registros(
             sesion_requerida.set()
             registro_inicializado.set()
             print(f"[!] {exc}")
-            await esperar_sesion_fuvex(browser, sesion_requerida)
+            await esperar_sesion_fuvex(browser, sesion_requerida, session_lock)
             continue
+        except ContextoNavegadorCerradoError:
+            registro_inicializado.set()
+            raise
         except Exception as exc:
             registro_inicializado.set()
             print(f"[!] No pude revisar filtros aprobados: {exc}")
@@ -494,6 +604,33 @@ async def proceso_registros(
             except RegistroRechazadoError as exc:
                 print(f"[!] {exc}; se revisara de nuevo en el siguiente ciclo.")
                 continue
+            except ConfirmacionExitoAnteriorError as exc:
+                dnis_verdes_atendidos.add(dni)
+                print(
+                    f"[!] {exc} No marcaré ni enviaré automáticamente el DNI {dni}; "
+                    "verifica en la lista de ventas a qué prospecto corresponde."
+                )
+                try:
+                    pagina_registro = await abrir_pagina_con_sesion(
+                        pagina_registro,
+                        browser,
+                        REGISTRO_URL,
+                        "registro_prospecto_bn.php",
+                        recargar=True,
+                        session_lock=session_lock,
+                        sesion_requerida=sesion_requerida,
+                    )
+                    print("[*] Formulario recargado tras cerrar la confirmación previa.")
+                except Exception as error_recarga:
+                    print(
+                        "[!] No pude recargar el formulario después de cerrar "
+                        f"la confirmación previa: {error_recarga}"
+                    )
+                continue
+            except RegistroBloqueadoPorDialogoError as exc:
+                print(f"[!] {exc}")
+                await esperar_cierre_dialogo_fuvex(pagina_registro)
+                continue
             except SesionFuvexExpiradaError as exc:
                 dnis_verdes_atendidos.add(dni)
                 sesion_requerida.set()
@@ -501,7 +638,7 @@ async def proceso_registros(
                     f"[!] {exc} El resultado puede ser incierto; verifica este DNI "
                     "en Fuvex antes de volver a procesarlo."
                 )
-                await esperar_sesion_fuvex(browser, sesion_requerida)
+                await esperar_sesion_fuvex(browser, sesion_requerida, session_lock)
                 break
             except RegistroSinConfirmarError as exc:
                 dnis_verdes_atendidos.add(dni)
@@ -509,7 +646,10 @@ async def proceso_registros(
                     f"[!] {exc}. No lo reintentare durante esta ejecucion para "
                     "evitar un posible registro duplicado; verifica el resultado en Fuvex."
                 )
+                await esperar_cierre_dialogo_fuvex(pagina_registro)
                 continue
+            except ContextoNavegadorCerradoError:
+                raise
             except Exception as exc:
                 print(f"[!] Fallo el registro del DNI {dni}: {exc}")
                 continue
@@ -650,9 +790,19 @@ async def main():
             )
             print("[*] Proceso de registro ejecutandose en paralelo al filtrado.")
             await registro_inicializado.wait()
+            if proceso_registro.done():
+                error = proceso_registro.exception()
+                if error is not None:
+                    raise error
+                raise RuntimeError("El proceso de registro terminó inesperadamente.")
             fallos_navegacion = 0
             while True:
-                await esperar_sesion_fuvex(browser, sesion_requerida)
+                if proceso_registro.done():
+                    error = proceso_registro.exception()
+                    if error is not None:
+                        raise error
+                    raise RuntimeError("El proceso de registro terminó inesperadamente.")
+                await esperar_sesion_fuvex(browser, sesion_requerida, session_lock)
                 try:
                     clientes = await asyncio.to_thread(
                         obtener_pendientes,
@@ -675,7 +825,7 @@ async def main():
 
                 pausa_por_filtros_agotados = False
                 for cliente in clientes:
-                    await esperar_sesion_fuvex(browser, sesion_requerida)
+                    await esperar_sesion_fuvex(browser, sesion_requerida, session_lock)
                     cliente_dni = str(cliente.get("dni", "")).strip()
                     try:
                         pagina_filtro = await enviar_filtro_con_espera(
@@ -707,7 +857,7 @@ async def main():
                         fallos_navegacion = 0
                         sesion_requerida.set()
                         print(f"[!] {exc}")
-                        await esperar_sesion_fuvex(browser, sesion_requerida)
+                        await esperar_sesion_fuvex(browser, sesion_requerida, session_lock)
                         break
                     except ValueError as exc:
                         fallos_navegacion = 0
@@ -720,6 +870,8 @@ async def main():
                         print(f"[!] Resultado de filtro incierto para {cliente_dni}: {exc}")
                         continue
                     except Exception as exc:
+                        if isinstance(exc, ContextoNavegadorCerradoError):
+                            raise
                         fallos_navegacion += 1
                         intento_cerrado = (
                             "Target page, context or browser has been closed"
@@ -729,7 +881,7 @@ async def main():
                             try:
                                 pagina_filtro = await browser.new_page()
                             except Exception as error_pestana:
-                                raise RuntimeError(
+                                raise ContextoNavegadorCerradoError(
                                     "Brave o su contexto de automatizacion se cerro. "
                                     "Reabre Brave y reinicia el programa."
                                 ) from error_pestana
@@ -781,3 +933,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n[*] Script detenido por el usuario.")
+    except ContextoNavegadorCerradoError as exc:
+        print(f"[!] {exc}")
