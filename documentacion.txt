@@ -7,3 +7,7 @@ instalar
 
 ejecutar
 .\.venv\Scripts\python.exe -m src.main
+
+El programa intenta reabrir Brave si se cierra inesperadamente. Si Fuvex solicita
+iniciar sesion o completar una verificacion, completala manualmente en Brave;
+el proceso permanecera esperando y continuara al confirmar el acceso.

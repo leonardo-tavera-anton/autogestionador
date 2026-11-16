@@ -24,6 +24,10 @@ class ClienteOmitidoError(RuntimeError):
     """Fuvex indico que el cliente ya se proceso o no esta disponible."""
 
 
+class ClienteYaFiltradoError(ClienteOmitidoError):
+    """Fuvex confirmo que el cliente ya tenia un filtro."""
+
+
 class FiltrosNoDisponiblesError(RuntimeError):
     """Fuvex no permite continuar porque no hay filtros disponibles."""
 
@@ -59,6 +63,10 @@ _CLIENTE_OMITIDO_RE = re.compile(
     r"|\b(?:SOLICITUD|FILTRO) (?:YA )?(?:ESTA|SE ENCUENTRA) "
     r"(?:PENDIENTE|EN ESPERA|EN PROCESO)\b"
 )
+_CLIENTE_YA_FILTRADO_RE = re.compile(
+    r"\b(?:YA )?(?:SE ENCUENTRA|FUE|HA SIDO|SE HA|ESTA|SIGUE) "
+    r"FILTRAD[OA]\b"
+)
 _SIN_FILTROS_RE = re.compile(
     r"\b(?:NO HAY|NO TIENE|NO CUENTA CON|SIN|AGOT[OA]S?) "
     r"(?:MAS )?(?:FILTROS?|SOLICITUDES?)\b"
@@ -77,6 +85,10 @@ def _normalizar(texto):
 
 def _cliente_omitido(texto):
     return bool(_CLIENTE_OMITIDO_RE.search(_normalizar(texto)))
+
+
+def _cliente_ya_filtrado(texto):
+    return bool(_CLIENTE_YA_FILTRADO_RE.search(_normalizar(texto)))
 
 
 def _sin_filtros_disponibles(texto):
@@ -502,6 +514,10 @@ async def filtrar_dni(page, dni, antes_de_enviar=None):
         ]
         mensaje = next((aviso for aviso in avisos_nuevos if _cliente_omitido(aviso)), None)
         if mensaje:
+            if _cliente_ya_filtrado(mensaje):
+                raise ClienteYaFiltradoError(
+                    re.sub(r"\s+", " ", mensaje).strip()
+                )
             raise ClienteOmitidoError(re.sub(r"\s+", " ", mensaje).strip())
         mensaje = next(
             (aviso for aviso in avisos_nuevos if _sin_filtros_disponibles(aviso)),
@@ -519,6 +535,10 @@ async def filtrar_dni(page, dni, antes_de_enviar=None):
     else:
         texto = await page.locator("body").inner_text()
         if _cliente_omitido(texto):
+            if _cliente_ya_filtrado(texto):
+                raise ClienteYaFiltradoError(
+                    "Fuvex confirmo que el DNI ya fue filtrado."
+                )
             raise ClienteOmitidoError(
                 "Fuvex indico que el DNI ya fue filtrado/registrado o no esta disponible."
             )

@@ -1,9 +1,18 @@
 import asyncio
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from src import main
-from src.scraper import SesionFuvexExpiradaError
+from src.scraper import (
+    ClienteYaFiltradoError,
+    SesionFuvexExpiradaError,
+    _cliente_omitido,
+    _cliente_ya_filtrado,
+)
+from src.heylocate_helper import (
+    _validar_celular_consultado,
+    consultar_operadora,
+)
 
 
 class FakeLocator:
@@ -54,6 +63,133 @@ class FakeBrowser:
 
 
 class SessionRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    def test_heylocate_rejects_a_different_default_number(self):
+        self.assertEqual(
+            _validar_celular_consultado("999999999", "+51 999 999 999"),
+            "999999999",
+        )
+        with self.assertRaisesRegex(RuntimeError, "988888888"):
+            _validar_celular_consultado("999999999", "988888888")
+
+    def test_heylocate_rejects_missing_or_invalid_client_number(self):
+        with self.assertRaises(ValueError):
+            _validar_celular_consultado("", "999999999")
+        with self.assertRaises(ValueError):
+            _validar_celular_consultado("123456789", "123456789")
+
+    async def test_heylocate_does_not_search_if_field_contains_another_number(self):
+        campo = AsyncMock()
+        campo.first = campo
+        campo.input_value.return_value = "988888888"
+        page = Mock()
+        page.goto = AsyncMock()
+        page.locator.return_value = campo
+        page.get_by_role = Mock()
+
+        with self.assertRaises(RuntimeError):
+            await consultar_operadora(page, "999999999")
+
+        campo.fill.assert_awaited_once_with("999999999")
+        page.get_by_role.assert_not_called()
+
+    async def test_main_restarts_after_browser_context_closes(self):
+        with (
+            patch.object(
+                main,
+                "_ejecutar_una_vez",
+                new_callable=AsyncMock,
+                side_effect=[
+                    main.ContextoNavegadorCerradoError("context closed"),
+                    asyncio.CancelledError,
+                ],
+            ) as run_once,
+            patch.object(main.asyncio, "sleep", new_callable=AsyncMock) as sleep,
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await main.main()
+
+        self.assertEqual(run_once.await_count, 2)
+        sleep.assert_awaited_once_with(5)
+
+    def test_existing_filter_message_is_classified_separately(self):
+        message = (
+            "este cliente (32042765) ya se encuentra filtrado "
+            "el (06/11/2026 10:15:37)"
+        )
+
+        self.assertTrue(_cliente_omitido(message))
+        self.assertTrue(_cliente_ya_filtrado(message))
+        self.assertTrue(issubclass(ClienteYaFiltradoError, main.ClienteOmitidoError))
+
+    async def test_registration_cycle_refreshes_list_and_registers_pending_client(self):
+        page_list = FakePage(main.FILTER_LIST_URL)
+        page_registration = FakePage(main.REGISTRO_URL)
+        browser = FakeBrowser([page_list])
+        registered = asyncio.Event()
+        session_required = asyncio.Event()
+        client = {
+            "dni": "12345678",
+            "nombre": "Cliente de prueba",
+            "celular": "999999999",
+        }
+
+        async def stop_after_first_check(_delay):
+            raise asyncio.CancelledError
+
+        with (
+            patch.object(main, "esperar_sesion_fuvex", new_callable=AsyncMock),
+            patch.object(
+                main,
+                "abrir_pagina_con_sesion",
+                new_callable=AsyncMock,
+                side_effect=[page_list, page_registration, page_registration],
+            ) as open_page,
+            patch.object(
+                main,
+                "dnis_con_filtro_correcto",
+                new_callable=AsyncMock,
+                return_value=["12345678"],
+            ),
+            patch.object(
+                main.asyncio,
+                "to_thread",
+                new_callable=AsyncMock,
+                side_effect=[client, None],
+            ),
+            patch.object(
+                main,
+                "consultar_operadora",
+                new_callable=AsyncMock,
+                return_value="ENTEL",
+            ),
+            patch.object(
+                main,
+                "registrar_prospecto",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as register,
+            patch.object(main.asyncio, "sleep", stop_after_first_check),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await main.proceso_registros(
+                    page_list,
+                    page_registration,
+                    FakePage("about:blank"),
+                    browser,
+                    5,
+                    set(),
+                    registered,
+                    asyncio.Lock(),
+                    None,
+                    session_required,
+                )
+
+        self.assertEqual(open_page.await_count, 3)
+        self.assertTrue(open_page.await_args_list[0].kwargs["recargar"])
+        register.assert_awaited_once()
+        self.assertEqual(register.await_args.args[1], "12345678")
+        self.assertTrue(registered.is_set())
+
     async def test_filter_limiter_uses_random_delay_range_between_sends(self):
         sleeps = []
 

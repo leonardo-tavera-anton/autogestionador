@@ -18,6 +18,7 @@ from src.scraper import (
     REGISTRO_URL,
     ColaEsperaLlenaError,
     ClienteOmitidoError,
+    ClienteYaFiltradoError,
     ConfirmacionExitoAnteriorError,
     FiltroSinConfirmarError,
     FiltrosNoDisponiblesError,
@@ -528,6 +529,7 @@ async def proceso_registros(
                 browser,
                 FILTER_LIST_URL,
                 "lista_filtros_f.php",
+                recargar=True,
                 session_lock=session_lock,
                 sesion_requerida=sesion_requerida,
             )
@@ -559,7 +561,7 @@ async def proceso_registros(
         except Exception as exc:
             registro_inicializado.set()
             print(f"[!] No pude revisar filtros aprobados: {exc}")
-            await asyncio.sleep(10)
+            await asyncio.sleep(intervalo_revision)
             continue
 
         operadores_validos = {
@@ -696,7 +698,7 @@ async def proceso_registros(
         await asyncio.sleep(intervalo_revision)
 
 
-async def main():
+async def _ejecutar_una_vez():
     brave_exe = encontrar_brave()
     if brave_exe is None:
         raise FileNotFoundError("No se encontro brave.exe. Configura BRAVE_PATH en .env.")
@@ -764,6 +766,9 @@ async def main():
 
             dnis_enviados_en_esta_sesion = set()
             intervalo_revision = max(30, int(os.getenv("FUVEX_INTERVAL_SECONDS", "60")))
+            intervalo_revision_registros = max(
+                1.0, float(os.getenv("FUVEX_REGISTRATION_CHECK_SECONDS", "5"))
+            )
             dnis_aprobados = set()
             registro_inicializado = asyncio.Event()
             sesion_requerida = asyncio.Event()
@@ -795,7 +800,7 @@ async def main():
                     pagina_registro,
                     pagina_operadora,
                     browser,
-                    intervalo_revision,
+                    intervalo_revision_registros,
                     dnis_aprobados,
                     registro_inicializado,
                     session_lock,
@@ -852,6 +857,25 @@ async def main():
                             sesion_requerida,
                         )
                         fallos_navegacion = 0
+                    except ClienteYaFiltradoError as exc:
+                        fallos_navegacion = 0
+                        dnis_enviados_en_esta_sesion.add(cliente_dni)
+                        try:
+                            await asyncio.to_thread(
+                                actualizar_estado_dni, cliente_dni, "filtrado"
+                            )
+                            print(
+                                f"[*] El DNI {cliente_dni} ya estaba filtrado; "
+                                "estado actualizado en Supabase."
+                            )
+                        except Exception as error_estado:
+                            print(
+                                f"[!] Fuvex confirmo que {cliente_dni} ya estaba "
+                                f"filtrado, pero no pude actualizar Supabase: "
+                                f"{error_estado}"
+                            )
+                        print(f"[*] Se omite el DNI {cliente_dni}: {exc}")
+                        continue
                     except ClienteOmitidoError as exc:
                         fallos_navegacion = 0
                         dnis_enviados_en_esta_sesion.add(cliente_dni)
@@ -941,6 +965,41 @@ async def main():
             except Exception:
                 # Brave pudo haberse cerrado manualmente durante la revision.
                 pass
+
+
+def _es_cierre_navegador(exc):
+    mensaje = str(exc).lower()
+    return any(
+        indicador in mensaje
+        for indicador in (
+            "target page, context or browser has been closed",
+            "browser has been closed",
+            "context closed",
+        )
+    )
+
+
+async def main():
+    espera_reinicio = 5
+    while True:
+        try:
+            await _ejecutar_una_vez()
+            raise RuntimeError("El ciclo principal termino inesperadamente.")
+        except ContextoNavegadorCerradoError as exc:
+            print(
+                f"[!] {exc} Se intentara reabrir Brave en "
+                f"{espera_reinicio} segundos."
+            )
+        except Exception as exc:
+            if not _es_cierre_navegador(exc):
+                raise
+            print(
+                f"[!] Brave o su contexto se cerro: {exc}. "
+                f"Se intentara reabrir en {espera_reinicio} segundos."
+            )
+
+        await asyncio.sleep(espera_reinicio)
+        espera_reinicio = min(espera_reinicio * 2, 60)
 
 
 if __name__ == "__main__":
