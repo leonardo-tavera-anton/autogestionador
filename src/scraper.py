@@ -100,6 +100,19 @@ def _cola_espera_llena(texto):
     return bool(_COLA_ESPERA_LLENA_RE.search(normalizado))
 
 
+def _url_solicita_inicio_sesion(url):
+    direccion = urlsplit(url)
+    host = (direccion.hostname or "").lower()
+    ruta = direccion.path.lower()
+    return host == "accounts.google.com" or (
+        host == "fuvexbn.a365.com.pe" and ruta.endswith("/index.php")
+    )
+
+
+def _url_sin_parametros(url):
+    return urlsplit(url)._replace(query="", fragment="").geturl()
+
+
 def fecha_estimada_visita(hoy=None):
     hoy = hoy or date.today()
     anio, mes = hoy.year, hoy.month
@@ -377,7 +390,8 @@ async def dnis_con_filtro_correcto(page):
         await abrir_pagina(page, FILTER_LIST_URL)
     if "lista_filtros_f.php" not in page.url.lower():
         raise RuntimeError(
-            f"Fuvex no dejo abrir la lista de filtros. URL final: {page.url}; "
+            f"Fuvex no dejo abrir la lista de filtros. "
+            f"URL final: {_url_sin_parametros(page.url)}; "
             f"titulo: {await page.title()}"
         )
     await page.wait_for_timeout(1000)
@@ -460,11 +474,8 @@ async def filtrar_dni(page, dni, antes_de_enviar=None):
 
     if "ingresar_filtro.php" not in page.url.lower():
         await abrir_pagina(page, FILTER_URL)
-    host = (urlsplit(page.url).hostname or "").lower()
-    ruta = urlsplit(page.url).path.lower()
     if (
-        host == "accounts.google.com"
-        or (host == "fuvexbn.a365.com.pe" and ruta.endswith("/index.php"))
+        _url_solicita_inicio_sesion(page.url)
         or await page.locator("#USUARIO").is_visible()
     ):
         raise SesionFuvexExpiradaError(
@@ -472,7 +483,8 @@ async def filtrar_dni(page, dni, antes_de_enviar=None):
         )
     if "ingresar_filtro.php" not in page.url.lower():
         raise RuntimeError(
-            f"Fuvex redirigio fuera de la pagina de filtros. URL final: {page.url}; "
+            f"Fuvex redirigio fuera de la pagina de filtros. "
+            f"URL final: {_url_sin_parametros(page.url)}; "
             f"titulo: {await page.title()}"
         )
 
@@ -495,14 +507,23 @@ async def filtrar_dni(page, dni, antes_de_enviar=None):
             await antes_de_enviar()
         await page.locator(selector_botones).nth(accion["index"]).click()
     except PlaywrightError as exc:
+        if _url_solicita_inicio_sesion(page.url):
+            raise SesionFuvexExpiradaError(
+                f"Fuvex solicito iniciar sesion al filtrar el DNI {dni}."
+            ) from exc
         raise FiltroSinConfirmarError(
-            f"No se pudo confirmar si Fuvex recibio el clic. URL: {page.url}"
+            "No se pudo confirmar si Fuvex recibio el clic. "
+            f"URL: {_url_sin_parametros(page.url)}"
         ) from exc
     confirmacion = page.get_by_text(
         re.compile(r"Se registr.{0,3} con .{0,3}xito", re.I)
     ).first
     aviso_cola_llena = page.get_by_text(_COLA_ESPERA_LLENA_RE).first
     for _ in range(80):
+        if _url_solicita_inicio_sesion(page.url):
+            raise SesionFuvexExpiradaError(
+                f"Fuvex solicito iniciar sesion al filtrar el DNI {dni}."
+            )
         if await confirmacion.count() and await confirmacion.is_visible():
             break
         if await aviso_cola_llena.count() and await aviso_cola_llena.is_visible():
@@ -533,6 +554,10 @@ async def filtrar_dni(page, dni, antes_de_enviar=None):
             raise ColaEsperaLlenaError(re.sub(r"\s+", " ", mensaje).strip())
         await page.wait_for_timeout(250)
     else:
+        if _url_solicita_inicio_sesion(page.url):
+            raise SesionFuvexExpiradaError(
+                f"Fuvex solicito iniciar sesion al filtrar el DNI {dni}."
+            )
         texto = await page.locator("body").inner_text()
         if _cliente_omitido(texto):
             if _cliente_ya_filtrado(texto):
@@ -553,7 +578,8 @@ async def filtrar_dni(page, dni, antes_de_enviar=None):
         detalle = re.sub(r"\s+", " ", texto)[:400]
         raise FiltroSinConfirmarError(
             f"Se pulso el boton, pero Fuvex no confirmo el filtro. "
-            f"URL: {page.url}; respuesta: {detalle or 'sin mensaje visible'}"
+            f"URL: {_url_sin_parametros(page.url)}; "
+            f"respuesta: {detalle or 'sin mensaje visible'}"
         )
 
     boton_ok = page.get_by_role("button", name="OK", exact=True).last

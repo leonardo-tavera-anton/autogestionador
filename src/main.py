@@ -10,6 +10,7 @@ from playwright.async_api import async_playwright
 from src.heylocate_helper import consultar_operadora
 
 load_dotenv()
+load_dotenv(".env.local", override=False)
 
 from src.db import actualizar_estado_dni, obtener_pendiente_por_dni, obtener_pendientes
 from src.scraper import (
@@ -69,6 +70,37 @@ def intervalo_aviso_google():
         ) from exc
 
 
+def _url_sin_parametros(url):
+    return urlsplit(url)._replace(query="", fragment="").geturl()
+
+
+async def _seleccionar_cuenta_google(browser, correo, timeout=15):
+    if not correo:
+        return False
+
+    limite = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < limite:
+        for candidate in browser.pages:
+            direccion = urlsplit(candidate.url)
+            if (
+                (direccion.hostname or "").lower() != "accounts.google.com"
+                or "accountchooser" not in direccion.path.lower()
+            ):
+                continue
+            cuenta = candidate.get_by_text(correo, exact=True).first
+            if await cuenta.count() and await cuenta.is_visible():
+                await cuenta.click(timeout=5000)
+                print("[*] Se seleccionó la cuenta de Google configurada.")
+                return True
+        await asyncio.sleep(0.25)
+
+    print(
+        "[!] No apareció la cuenta de Google configurada; "
+        "selecciónala manualmente en Brave."
+    )
+    return False
+
+
 async def iniciar_sesion(page, browser):
     if not MENU_PATTERN.search(page.url):
         await page.goto(LOGIN_URL, wait_until="domcontentloaded")
@@ -96,6 +128,9 @@ async def iniciar_sesion(page, browser):
         ) from exc
 
     await boton_google.click()
+    await _seleccionar_cuenta_google(
+        browser, os.getenv("GOOGLE_ACCOUNT_EMAIL", "").strip()
+    )
     intervalo_aviso = intervalo_aviso_google()
     print("[*] Google espera que elijas la cuenta autorizada en Brave y completes cualquier verificacion.")
 
@@ -130,7 +165,9 @@ async def iniciar_sesion(page, browser):
 
         ahora = asyncio.get_running_loop().time()
         if ahora >= siguiente_aviso:
-            urls = ", ".join(candidate.url for candidate in paginas) or "ninguna pestaña abierta"
+            urls = ", ".join(
+                _url_sin_parametros(candidate.url) for candidate in paginas
+            ) or "ninguna pestaña abierta"
             print(
                 "[!] El acceso de Google sigue pendiente. Completa la selección de cuenta "
                 f"y cualquier verificación en Brave. Pestañas: {urls}"
@@ -186,15 +223,45 @@ async def pagina_inicio_sesion_fuvex(page):
         return False
 
 
+async def _restaurar_sesion_fuvex(browser, sesion_requerida):
+    paginas = list(browser.pages)
+    pagina_acceso = next(
+        (
+            page for page in paginas
+            if (urlsplit(page.url).hostname or "").lower()
+            == "fuvexbn.a365.com.pe"
+        ),
+        None,
+    )
+    if pagina_acceso is None:
+        pagina_acceso = await browser.new_page()
+
+    pagina_acceso = await iniciar_sesion(pagina_acceso, browser)
+    if not await pagina_sesion_fuvex_activa(pagina_acceso):
+        raise SesionFuvexExpiradaError(
+            "El inicio de sesión automático no confirmó una sesión activa de Fuvex."
+        )
+
+    await pagina_acceso.goto(
+        FILTER_URL, wait_until="domcontentloaded", timeout=45000
+    )
+    if not await pagina_sesion_fuvex_activa(pagina_acceso):
+        raise SesionFuvexExpiradaError(
+            "Fuvex volvió a pedir acceso después del inicio de sesión."
+        )
+
+    sesion_requerida.clear()
+    print("[*] Sesión de Fuvex restaurada y verificada automáticamente.")
+
+
 async def esperar_sesion_fuvex(browser, sesion_requerida, session_lock=None):
-    """Pausa ambos ciclos hasta que el usuario complete el acceso autorizado."""
+    """Restaura la sesion autorizada o pausa los ciclos hasta verificarla."""
     if not sesion_requerida.is_set():
         return
 
-    print(
-        "[!] Sesión pausada. Completa el acceso a Fuvex en Brave."
-    )
+    print("[!] Sesión vencida. Intentando restaurarla con el perfil autorizado de Brave.")
     siguiente_aviso = asyncio.get_running_loop().time() + intervalo_aviso_google()
+    siguiente_reintento = 0.0
     while sesion_requerida.is_set():
         try:
             paginas = list(browser.pages)
@@ -250,9 +317,46 @@ async def esperar_sesion_fuvex(browser, sesion_requerida, session_lock=None):
                     return
             except Exception:
                 continue
+
+        ahora = asyncio.get_running_loop().time()
+        if ahora >= siguiente_reintento:
+            try:
+                if session_lock is None:
+                    await _restaurar_sesion_fuvex(browser, sesion_requerida)
+                else:
+                    async with session_lock:
+                        if sesion_requerida.is_set():
+                            await _restaurar_sesion_fuvex(
+                                browser, sesion_requerida
+                            )
+                if not sesion_requerida.is_set():
+                    return
+            except ContextoNavegadorCerradoError:
+                raise
+            except Exception as exc:
+                if _es_cierre_navegador(exc):
+                    raise ContextoNavegadorCerradoError(
+                        "Brave o su contexto se cerro durante la restauracion "
+                        "de la sesion."
+                    ) from exc
+                print(
+                    f"[!] No pude restaurar la sesión automáticamente: {exc}. "
+                    "Completa el acceso o la verificación pendiente en Brave."
+                )
+                siguiente_reintento = (
+                    asyncio.get_running_loop().time()
+                    + min(intervalo_aviso_google(), 60)
+                )
+
         ahora = asyncio.get_running_loop().time()
         if ahora >= siguiente_aviso:
-            print("[!] Fuvex aún requiere acceso. Completa Google/verificación en Brave.")
+            urls = ", ".join(
+                _url_sin_parametros(page.url) for page in paginas
+            ) or "ninguna pestaña abierta"
+            print(
+                "[!] Fuvex aún requiere acceso. Completa Google/verificación "
+                f"en Brave. Pestañas: {urls}"
+            )
             siguiente_aviso = ahora + intervalo_aviso_google()
         await asyncio.sleep(2)
 
@@ -328,16 +432,23 @@ async def abrir_pagina_con_sesion(
     session_lock=None,
     sesion_requerida=None,
 ):
-    if sesion_requerida is not None:
-        await esperar_sesion_fuvex(browser, sesion_requerida, session_lock)
-    if session_lock is None:
-        return await _abrir_pagina_con_sesion(
-            page, browser, url, ruta_esperada, recargar
-        )
-    async with session_lock:
-        return await _abrir_pagina_con_sesion(
-            page, browser, url, ruta_esperada, recargar
-        )
+    while True:
+        if sesion_requerida is not None:
+            await esperar_sesion_fuvex(browser, sesion_requerida, session_lock)
+        try:
+            if session_lock is None:
+                return await _abrir_pagina_con_sesion(
+                    page, browser, url, ruta_esperada, recargar
+                )
+            async with session_lock:
+                return await _abrir_pagina_con_sesion(
+                    page, browser, url, ruta_esperada, recargar
+                )
+        except SesionFuvexExpiradaError as exc:
+            if sesion_requerida is None:
+                raise
+            print(f"[!] {exc} Intentando recuperar la sesión antes de continuar.")
+            sesion_requerida.set()
 
 
 def crear_limitador_envios(intervalo_minimo, tipo_envio):
@@ -741,17 +852,31 @@ async def _ejecutar_una_vez():
             pagina_lista = await browser.new_page()
             pagina_registro = await browser.new_page()
             pagina_operadora = await browser.new_page()
+            sesion_requerida = asyncio.Event()
+            session_lock = asyncio.Lock()
             pagina_filtro = await abrir_pagina_con_sesion(
-                pagina_filtro, browser, FILTER_URL, "ingresar_filtro.php"
+                pagina_filtro,
+                browser,
+                FILTER_URL,
+                "ingresar_filtro.php",
+                session_lock=session_lock,
+                sesion_requerida=sesion_requerida,
             )
             pagina_lista = await abrir_pagina_con_sesion(
-                pagina_lista, browser, FILTER_LIST_URL, "lista_filtros_f.php"
+                pagina_lista,
+                browser,
+                FILTER_LIST_URL,
+                "lista_filtros_f.php",
+                session_lock=session_lock,
+                sesion_requerida=sesion_requerida,
             )
             pagina_registro = await abrir_pagina_con_sesion(
                 pagina_registro,
                 browser,
                 "https://fuvexbn.a365.com.pe:7443/BN/Registro_Prospecto_BN.php",
                 "registro_prospecto_bn.php",
+                session_lock=session_lock,
+                sesion_requerida=sesion_requerida,
             )
             await limpiar_pestanas_fuvex(
                 browser,
@@ -767,15 +892,13 @@ async def _ejecutar_una_vez():
             dnis_enviados_en_esta_sesion = set()
             intervalo_revision = max(30, int(os.getenv("FUVEX_INTERVAL_SECONDS", "60")))
             intervalo_revision_registros = max(
-                1.0, float(os.getenv("FUVEX_REGISTRATION_CHECK_SECONDS", "5"))
+                60.0, float(os.getenv("FUVEX_REGISTRATION_CHECK_SECONDS", "60"))
             )
             dnis_aprobados = set()
             registro_inicializado = asyncio.Event()
-            sesion_requerida = asyncio.Event()
-            session_lock = asyncio.Lock()
             intervalo_entre_filtros = (
-                float(os.getenv("FUVEX_FILTER_DELAY_MIN_SECONDS", "5")),
-                float(os.getenv("FUVEX_FILTER_DELAY_MAX_SECONDS", "10")),
+                float(os.getenv("FUVEX_FILTER_DELAY_MIN_SECONDS", "10")),
+                float(os.getenv("FUVEX_FILTER_DELAY_MAX_SECONDS", "15")),
             )
             if (
                 intervalo_entre_filtros[0] < 0

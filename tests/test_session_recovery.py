@@ -6,8 +6,11 @@ from src import main
 from src.scraper import (
     ClienteYaFiltradoError,
     SesionFuvexExpiradaError,
+    _url_sin_parametros,
+    _url_solicita_inicio_sesion,
     _cliente_omitido,
     _cliente_ya_filtrado,
+    filtrar_dni,
 )
 from src.heylocate_helper import (
     _validar_celular_consultado,
@@ -63,6 +66,82 @@ class FakeBrowser:
 
 
 class SessionRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_google_account_selector_clicks_only_configured_email(self):
+        account = Mock()
+        account.count = AsyncMock(return_value=1)
+        account.is_visible = AsyncMock(return_value=True)
+        account.click = AsyncMock()
+        text_locator = Mock()
+        text_locator.first = account
+        page = Mock()
+        page.url = "https://accounts.google.com/v3/signin/accountchooser"
+        page.get_by_text = Mock(return_value=text_locator)
+        browser = FakeBrowser([page])
+
+        selected = await main._seleccionar_cuenta_google(
+            browser, "authorized@example.com"
+        )
+
+        self.assertTrue(selected)
+        page.get_by_text.assert_called_once_with(
+            "authorized@example.com", exact=True
+        )
+        account.click.assert_awaited_once_with(timeout=5000)
+        self.assertEqual(
+            main._url_sin_parametros(
+                "https://accounts.google.com/signin?state=temporary"
+            ),
+            "https://accounts.google.com/signin",
+        )
+
+    def test_google_account_chooser_is_detected_without_logging_query_tokens(self):
+        url = (
+            "https://accounts.google.com/v3/signin/accountchooser"
+            "?client_id=private&state=temporary"
+        )
+
+        self.assertTrue(_url_solicita_inicio_sesion(url))
+        self.assertEqual(
+            _url_sin_parametros(url),
+            "https://accounts.google.com/v3/signin/accountchooser",
+        )
+        self.assertFalse(_url_solicita_inicio_sesion(main.FILTER_URL))
+
+    async def test_filter_redirect_to_google_requests_session_recovery(self):
+        page = FakePage(main.FILTER_URL, authenticated=True)
+        campo_dni = Mock()
+        campo_dni.fill = AsyncMock()
+        boton = Mock()
+
+        async def redirect_to_google():
+            page.url = (
+                "https://accounts.google.com/v3/signin/accountchooser"
+                "?client_id=private"
+            )
+
+        boton.click = AsyncMock(side_effect=redirect_to_google)
+        botones = Mock()
+        botones.evaluate_all = AsyncMock(
+            return_value=[{"index": 0, "text": "Filtrar"}]
+        )
+        botones.nth = Mock(return_value=boton)
+        page.locator = Mock(
+            side_effect=lambda selector: (
+                FakeLocator(page, selector)
+                if selector == "#USUARIO"
+                else botones
+            )
+        )
+
+        with (
+            patch("src.scraper._buscar_campo", new_callable=AsyncMock, return_value=campo_dni),
+            patch("src.scraper._avisos_visibles", new_callable=AsyncMock, return_value=[]),
+        ):
+            with self.assertRaises(SesionFuvexExpiradaError):
+                await filtrar_dni(page, "12345678")
+
+        boton.click.assert_awaited_once()
+
     def test_heylocate_rejects_a_different_default_number(self):
         self.assertEqual(
             _validar_celular_consultado("999999999", "+51 999 999 999"),
@@ -196,55 +275,101 @@ class SessionRecoveryTests(unittest.IsolatedAsyncioTestCase):
         async def record_sleep(delay):
             sleeps.append(delay)
 
-        limiter = main.crear_limitador_envios((5.0, 10.0), "filtro")
+        limiter = main.crear_limitador_envios((10.0, 15.0), "filtro")
         with (
-            patch.object(main.random, "uniform", return_value=7.5) as choose_interval,
+            patch.object(main.random, "uniform", return_value=12.5) as choose_interval,
             patch.object(main.asyncio, "sleep", record_sleep),
         ):
             await limiter()
             await limiter()
 
-        choose_interval.assert_called_once_with(5.0, 10.0)
+        choose_interval.assert_called_once_with(10.0, 15.0)
         self.assertEqual(len(sleeps), 1)
         self.assertGreater(sleeps[0], 0)
-        self.assertLessEqual(sleeps[0], 7.5)
+        self.assertLessEqual(sleeps[0], 12.5)
 
-    async def test_old_module_tab_does_not_resume_expired_session(self):
+    async def test_expired_session_is_restored_with_existing_browser_profile(self):
         page = FakePage(main.FILTER_URL)
         browser = FakeBrowser([page])
         session_required = asyncio.Event()
         session_required.set()
         session_lock = asyncio.Lock()
 
-        recoveries = [
-            asyncio.create_task(
-                main.esperar_sesion_fuvex(
-                    browser, session_required, session_lock
-                )
+        async def restore_existing_login(page_to_restore, _browser):
+            page_to_restore.authenticated = True
+            page_to_restore.url = (
+                "https://fuvexbn.a365.com.pe:7443/general/menu.php"
             )
-            for _ in range(2)
-        ]
-        try:
-            for _ in range(50):
-                if page.navigation_count:
-                    break
-                await asyncio.sleep(0.02)
+            return page_to_restore
 
-            self.assertGreater(page.navigation_count, 0)
-            self.assertTrue(session_required.is_set())
-            self.assertEqual(page.url, main.LOGIN_URL)
+        with patch.object(
+            main, "iniciar_sesion", side_effect=restore_existing_login
+        ) as login:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    *(
+                        main.esperar_sesion_fuvex(
+                            browser, session_required, session_lock
+                        )
+                        for _ in range(2)
+                    )
+                ),
+                timeout=5,
+            )
 
-            page.authenticated = True
-            page.url = "https://fuvexbn.a365.com.pe:7443/general/menu.php"
-            await asyncio.wait_for(asyncio.gather(*recoveries), timeout=5)
+        login.assert_awaited_once()
+        self.assertFalse(session_required.is_set())
+        self.assertEqual(page.url, main.FILTER_URL)
 
-            self.assertFalse(session_required.is_set())
-            self.assertEqual(page.url, main.FILTER_URL)
-        finally:
-            for recovery in recoveries:
-                if not recovery.done():
-                    recovery.cancel()
-            await asyncio.gather(*recoveries, return_exceptions=True)
+    async def test_closed_context_during_reauth_triggers_browser_restart(self):
+        page = FakePage(main.FILTER_URL)
+        browser = FakeBrowser([page])
+        session_required = asyncio.Event()
+        session_required.set()
+
+        with patch.object(
+            main,
+            "iniciar_sesion",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError(
+                "BrowserContext.new_page: Target page, context or browser has been closed"
+            ),
+        ):
+            with self.assertRaises(main.ContextoNavegadorCerradoError):
+                await main.esperar_sesion_fuvex(browser, session_required)
+
+    async def test_module_open_reauthenticates_and_retries_during_startup(self):
+        page = FakePage(main.FILTER_URL, authenticated=True)
+        browser = FakeBrowser([page])
+        session_required = asyncio.Event()
+        open_attempts = 0
+
+        async def open_module(*args, **kwargs):
+            nonlocal open_attempts
+            del args, kwargs
+            open_attempts += 1
+            if open_attempts == 1:
+                raise SesionFuvexExpiradaError("Fuvex requiere iniciar sesión.")
+            return page
+
+        async def restore_session(_browser, required, _lock):
+            required.clear()
+
+        with (
+            patch.object(main, "_abrir_pagina_con_sesion", side_effect=open_module),
+            patch.object(main, "esperar_sesion_fuvex", side_effect=restore_session) as wait,
+        ):
+            result = await main.abrir_pagina_con_sesion(
+                page,
+                browser,
+                main.FILTER_URL,
+                "ingresar_filtro.php",
+                sesion_requerida=session_required,
+            )
+
+        self.assertIs(result, page)
+        self.assertEqual(open_attempts, 2)
+        self.assertEqual(wait.await_count, 2)
 
     async def test_module_redirect_to_login_requests_coordinated_reauth(self):
         page = FakePage("about:blank")

@@ -10,4 +10,11 @@ ejecutar
 
 El programa intenta reabrir Brave si se cierra inesperadamente. Si Fuvex solicita
 iniciar sesion o completar una verificacion, completala manualmente en Brave;
-el proceso permanecera esperando y continuara al confirmar el acceso.
+el proceso intentara restaurar la sesion cada minuto y continuara al confirmar
+el acceso. Google puede requerir que vuelvas a elegir la cuenta o completes una
+verificacion manual.
+
+Para seleccionar automaticamente una cuenta ya autorizada en el selector de
+Google, configura GOOGLE_ACCOUNT_EMAIL en el archivo local ignorado .env.local.
+La contraseña y cualquier verificacion adicional siguen siendo gestionadas
+por Google.
