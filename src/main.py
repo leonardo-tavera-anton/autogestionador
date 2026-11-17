@@ -24,6 +24,7 @@ from src.scraper import (
     FiltroSinConfirmarError,
     FiltrosNoDisponiblesError,
     RegistroBloqueadoPorDialogoError,
+    RegistroAccesoDenegadoError,
     RegistroRechazadoError,
     RegistroSinConfirmarError,
     SesionFuvexExpiradaError,
@@ -719,6 +720,14 @@ async def proceso_registros(
             except ClienteOmitidoError as exc:
                 dnis_verdes_atendidos.add(dni)
                 print(f"[*] Se omite el DNI {dni} y se continua: {exc}")
+                continue
+            except RegistroAccesoDenegadoError as exc:
+                dnis_verdes_atendidos.add(dni)
+                print(
+                    f"[!] {exc} No se actualizara Supabase ni se reintentara "
+                    "durante esta ejecucion; verifica los permisos de registro "
+                    "de tu cuenta en Fuvex."
+                )
                 continue
             except RegistroRechazadoError as exc:
                 print(f"[!] {exc}; se revisara de nuevo en el siguiente ciclo.")

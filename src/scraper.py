@@ -44,6 +44,10 @@ class RegistroRechazadoError(RuntimeError):
     """Fuvex rechazo el registro y mostro un mensaje de error."""
 
 
+class RegistroAccesoDenegadoError(RegistroRechazadoError):
+    """Fuvex denego el acceso a la operacion de registro."""
+
+
 class RegistroBloqueadoPorDialogoError(RuntimeError):
     """Un diálogo anterior de Fuvex impide iniciar un nuevo registro."""
 
@@ -98,6 +102,15 @@ def _sin_filtros_disponibles(texto):
 def _cola_espera_llena(texto):
     normalizado = re.sub(r"\s+", " ", _normalizar(texto))
     return bool(_COLA_ESPERA_LLENA_RE.search(normalizado))
+
+
+def _mensaje_acceso_denegado(texto):
+    normalizado = re.sub(r"\s+", " ", _normalizar(texto))
+    coincidencia = re.search(
+        r"\bACCESO\s+DENEGADO(?:\s*[.:,-]?\s*\d+)?\b",
+        normalizado,
+    )
+    return coincidencia.group(0) if coincidencia else None
 
 
 def _url_solicita_inicio_sesion(url):
@@ -742,6 +755,7 @@ async def registrar_prospecto(
                         "EXITO",
                         "EXITOSAMENTE",
                         "ERROR",
+                        "ACCESO DENEGADO",
                         "OBLIGATORIO",
                         "NO SE PUDO",
                     )
@@ -769,6 +783,12 @@ async def registrar_prospecto(
     texto = _normalizar(await page.locator("body").inner_text())
     avisos = await _avisos_visibles(page)
     respuesta = _normalizar(" ".join([*dialogos, *avisos, texto]))
+    acceso_denegado = _mensaje_acceso_denegado(respuesta)
+    if acceso_denegado:
+        raise RegistroAccesoDenegadoError(
+            f"Fuvex respondio '{acceso_denegado}' al intentar registrar {dni}."
+        )
+
     mensaje = next(
         (aviso for aviso in avisos if _cliente_omitido(aviso)),
         None,

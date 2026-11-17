@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from src import main
 from src.scraper import (
     ClienteYaFiltradoError,
+    _mensaje_acceso_denegado,
     SesionFuvexExpiradaError,
     _url_sin_parametros,
     _url_solicita_inicio_sesion,
@@ -199,6 +200,13 @@ class SessionRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(_cliente_omitido(message))
         self.assertTrue(_cliente_ya_filtrado(message))
         self.assertTrue(issubclass(ClienteYaFiltradoError, main.ClienteOmitidoError))
+
+    def test_registration_access_denied_message_is_detected(self):
+        self.assertEqual(
+            _mensaje_acceso_denegado("Acceso denegado.2"),
+            "ACCESO DENEGADO.2",
+        )
+        self.assertIsNone(_mensaje_acceso_denegado("Registro guardado con éxito"))
 
     async def test_registration_cycle_refreshes_list_and_registers_pending_client(self):
         page_list = FakePage(main.FILTER_LIST_URL)
