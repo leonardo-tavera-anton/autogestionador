@@ -162,7 +162,10 @@ def _es_confirmacion_exito(texto):
     normalizado = _normalizar(texto)
     return bool(
         re.search(
-            r"\b(?:SE )?REGISTRO CON EXITO\b|\bREGISTRAD[OA] CON EXITO\b",
+            r"\b(?:SE )?REGISTR(?:O|ADO|ADA) (?:CON|DE) (?:EXITO|EXITO[S]AMENTE)\b"
+            r"|\b(?:REGISTRAD[OA]|GUARDAD[OA]) (?:CON )?(?:EXITO|EXITOSAMENTE)\b"
+            r"|\bREGISTR(?:O|ADO|ADA) EXITOSAMENTE\b"
+            r"|\bREGISTR(?:O|ADO|ADA) (?:SE )?REALIZ(?:O|ADO|ADA) (?:CON )?EXITO\b",
             normalizado,
         )
     )
@@ -223,28 +226,36 @@ async def _aceptar_confirmacion_exito(page):
         (
             indice
             for indice, etiqueta in enumerate(etiquetas)
-            if re.fullmatch(r"(?:OK|ACEPTAR|CONTINUAR)", etiqueta, re.I)
+            if re.fullmatch(
+                r"(?:OK|ACEPTAR|CONTINUAR|CERRAR|ENTENDIDO|FINALIZAR|SI|YES)",
+                etiqueta,
+                re.I,
+            )
         ),
         None,
     )
+    if indice_ok is None and modal_visible and etiquetas:
+        indice_ok = 0
     if indice_ok is None:
         if modal_visible:
-            raise RuntimeError(
-                "Fuvex mostro la confirmacion de registro, pero no encontre "
-                "un boton visible OK/Aceptar para cerrarla."
-            )
-        return False
+            try:
+                await page.keyboard.press("Escape")
+            except (AttributeError, PlaywrightError):
+                pass
+        else:
+            return False
 
-    boton_ok = botones.nth(indice_ok)
-    try:
-        await boton_ok.click(force=True, timeout=5000)
-    except PlaywrightError as exc:
+    if indice_ok is not None:
+        boton_ok = botones.nth(indice_ok)
         try:
-            await boton_ok.evaluate("(elemento) => elemento.click()")
-        except PlaywrightError as fallback_exc:
-            raise RuntimeError(
-                "No pude pulsar el boton OK/Aceptar de la confirmacion de Fuvex."
-            ) from fallback_exc
+            await boton_ok.click(force=True, timeout=5000)
+        except PlaywrightError:
+            try:
+                await boton_ok.evaluate("(elemento) => elemento.click()")
+            except PlaywrightError as fallback_exc:
+                raise RuntimeError(
+                    "No pude pulsar el boton para cerrar la confirmacion de Fuvex."
+                ) from fallback_exc
 
     if modal_visible:
         try:

@@ -6,6 +6,8 @@ from src import main
 from src.scraper import (
     ClienteYaFiltradoError,
     _mensaje_acceso_denegado,
+    _aceptar_confirmacion_exito,
+    _es_confirmacion_exito,
     SesionFuvexExpiradaError,
     _url_sin_parametros,
     _url_solicita_inicio_sesion,
@@ -207,6 +209,52 @@ class SessionRecoveryTests(unittest.IsolatedAsyncioTestCase):
             "ACCESO DENEGADO.2",
         )
         self.assertIsNone(_mensaje_acceso_denegado("Registro guardado con éxito"))
+
+    def test_registration_success_notice_variants_are_detected(self):
+        self.assertTrue(_es_confirmacion_exito("El registro se realizó con éxito"))
+        self.assertTrue(_es_confirmacion_exito("Registro guardado exitosamente"))
+        self.assertTrue(_es_confirmacion_exito("Prospecto registrado con éxito"))
+
+    async def test_registration_success_notice_closes_cerrar_button(self):
+        modal = Mock()
+        modal.count = AsyncMock(return_value=1)
+        modal.wait_for = AsyncMock()
+
+        special_buttons = Mock()
+        special_buttons.count = AsyncMock(return_value=1)
+        special_buttons.evaluate_all = AsyncMock(return_value=["Cerrar"])
+        special_buttons.nth = Mock()
+        modal_buttons = Mock()
+        modal_buttons.count = AsyncMock(return_value=1)
+        modal_buttons.evaluate_all = AsyncMock(return_value=["Cerrar"])
+        modal_buttons.nth = Mock()
+
+        close_button = Mock()
+        close_button.click = AsyncMock()
+        special_buttons.nth.return_value = close_button
+        modal.locator = Mock(
+            side_effect=lambda selector: (
+                special_buttons
+                if ".swal-button--confirm" in selector
+                else modal_buttons
+            )
+        )
+
+        overlay = Mock()
+        overlay.count = AsyncMock(return_value=0)
+        overlay.last = overlay
+
+        page = Mock()
+        page.locator = Mock(
+            side_effect=lambda selector: (
+                Mock(last=modal)
+                if ".swal-modal" in selector
+                else overlay
+            )
+        )
+
+        self.assertTrue(await _aceptar_confirmacion_exito(page))
+        close_button.click.assert_awaited_once_with(force=True, timeout=5000)
 
     async def test_registration_cycle_refreshes_list_and_registers_pending_client(self):
         page_list = FakePage(main.FILTER_LIST_URL)
