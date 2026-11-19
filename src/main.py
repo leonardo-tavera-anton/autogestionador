@@ -689,16 +689,19 @@ async def proceso_registros(
                     pagina_operadora, cliente.get("celular", "")
                 )
             except Exception as exc:
-                print(f"[!] No pude consultar la operadora del DNI {dni}: {exc}")
-                continue
+                print(
+                    f"[!] No pude verificar la operadora del DNI {dni}: {exc}. "
+                    "Se registrara como Bitel."
+                )
+                operador_detectado = "DESCONOCIDA"
 
             operador = operadores_validos.get(operador_detectado)
             if operador is None:
+                operador = "Bitel"
                 print(
                     f"[!] HeyLocate no dio una operadora verificable para DNI {dni}; "
-                    "se volvera a intentar en el proximo ciclo."
+                    "se usara Bitel."
                 )
-                continue
 
             try:
                 pagina_registro = await abrir_pagina_con_sesion(

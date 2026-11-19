@@ -165,7 +165,9 @@ def _es_confirmacion_exito(texto):
             r"\b(?:SE )?REGISTR(?:O|ADO|ADA) (?:CON|DE) (?:EXITO|EXITO[S]AMENTE)\b"
             r"|\b(?:REGISTRAD[OA]|GUARDAD[OA]) (?:CON )?(?:EXITO|EXITOSAMENTE)\b"
             r"|\bREGISTR(?:O|ADO|ADA) EXITOSAMENTE\b"
-            r"|\bREGISTR(?:O|ADO|ADA) (?:SE )?REALIZ(?:O|ADO|ADA) (?:CON )?EXITO\b",
+            r"|\bREGISTR(?:O|ADO|ADA) (?:SE )?(?:HA |HE )?REALIZ(?:O|ADO|ADA)"
+            r"(?: CON)? EXITO(?:SAMENTE)?\b"
+            r"|\bREGISTR(?:O|ADO|ADA) (?:CORRECTA|SATISFACTORIAMENTE)\b",
             normalizado,
         )
     )

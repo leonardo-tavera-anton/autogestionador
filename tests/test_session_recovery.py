@@ -212,6 +212,8 @@ class SessionRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
     def test_registration_success_notice_variants_are_detected(self):
         self.assertTrue(_es_confirmacion_exito("El registro se realizó con éxito"))
+        self.assertTrue(_es_confirmacion_exito("El registro se ha realizado con éxito"))
+        self.assertTrue(_es_confirmacion_exito("El registro realizado con éxito"))
         self.assertTrue(_es_confirmacion_exito("Registro guardado exitosamente"))
         self.assertTrue(_es_confirmacion_exito("Prospecto registrado con éxito"))
 
